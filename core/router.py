@@ -209,10 +209,10 @@ class QueryRouter:
             f"Reasoning: {decision.reasoning}"
         ]
         if decision.has_file:
-            lines.append("📎 Files attached")
+            lines.append("Files attached")
         if decision.has_image:
-            lines.append("🖼️ Images attached")
+            lines.append("Images attached")
         if decision.needs_web_search:
-            lines.append("🌐 Web search enabled")
+            lines.append("Web search enabled")
         
         return "\n".join(lines)

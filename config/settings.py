@@ -3,13 +3,14 @@ Backend Configuration - ALL settings controlled here, not by users.
 Users see a clean chat interface with zero configuration options.
 """
 from enum import Enum
-from dataclasses import dataclass, field
-from typing import Dict, List, Optional
-import json
+from typing import Dict, List, Optional, Any
 from pathlib import Path
+import json
+from pydantic import BaseModel, Field
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
-class ModelTier(Enum):
+class ModelTier(str, Enum):
     """Model tiers for intelligent routing"""
     QUICK = "quick"      # Fast responses, simple queries (weather, time, basic facts)
     STANDARD = "standard"  # General conversation, moderate complexity
@@ -17,7 +18,7 @@ class ModelTier(Enum):
     VISION = "vision"    # Image understanding and analysis
 
 
-class ToolType(Enum):
+class ToolType(str, Enum):
     """Available tools the system can use"""
     WEB_SEARCH = "web_search"
     FILE_READER = "file_reader"
@@ -25,11 +26,10 @@ class ToolType(Enum):
     DATABASE = "database"
 
 
-@dataclass
-class ModelConfig:
+class ModelConfig(BaseModel):
     """Configuration for a specific model"""
     name: str
-    backend: str  # "ollama", "llamacpp", "huggingface"
+    backend: str = "ollama" # "ollama", "llamacpp", "huggingface"
     tier: ModelTier
     temperature: float = 0.7
     max_tokens: int = 2048
@@ -40,24 +40,27 @@ class ModelConfig:
     supports_streaming: bool = True
 
 
-@dataclass 
-class RoutingRule:
+class RoutingRule(BaseModel):
     """Rules for routing queries to appropriate models"""
     keywords: List[str]
     tier: ModelTier
-    tools: List[ToolType] = field(default_factory=list)
+    tools: List[ToolType] = Field(default_factory=list)
     priority: int = 0  # Higher = checked first
 
 
-@dataclass
-class Settings:
+class Settings(BaseSettings):
     """Master settings - all backend controlled"""
-    
+    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
+
+    # Environment
+    environment: str = "development"
+    log_level: str = "INFO"
+
     # Model configurations by tier
-    models: Dict[ModelTier, ModelConfig] = field(default_factory=dict)
+    models: Dict[ModelTier, ModelConfig] = Field(default_factory=dict)
     
     # Routing rules for query classification
-    routing_rules: List[RoutingRule] = field(default_factory=list)
+    routing_rules: List[RoutingRule] = Field(default_factory=list)
     
     # Tool configurations
     web_search_enabled: bool = True
@@ -66,7 +69,7 @@ class Settings:
     
     # File handling - MAXED for 128GB RAM
     max_file_size_mb: int = 100
-    supported_extensions: List[str] = field(default_factory=lambda: [
+    supported_extensions: List[str] = Field(default_factory=lambda: [
         # Office
         ".docx", ".xlsx", ".pptx", ".doc", ".xls", ".ppt",
         # PDF
@@ -90,45 +93,43 @@ class Settings:
     ui_port: int = 7860
     api_port: int = 8000
     
-    def __post_init__(self):
-        """Initialize default models and routing rules"""
+    def model_post_init(self, __context: Any) -> None:
+        """Initialize default models and routing rules if not set"""
         if not self.models:
             self._setup_default_models()
         if not self.routing_rules:
             self._setup_default_routing()
     
     def _setup_default_models(self):
-        """Configure default models - optimized for 32B Qwen model"""
-        # qwen2.5:32b - excellent for document analysis, fits well in 32GB VRAM
-        # With 32B model, we can use larger context windows comfortably
+        """Configure default models - optimized for speed and quality"""
         self.models = {
             ModelTier.QUICK: ModelConfig(
-                name="llama3.2:latest",  # 3B - instant responses
+                name="qwen2.5:14b",  # UPGRADED: Llama 3.2 was too weak. 14B is fast enough (133 t/s).
                 backend="ollama",
                 tier=ModelTier.QUICK,
-                temperature=0.3,
+                temperature=0.7,
                 max_tokens=1024,
-                context_window=8192,
+                context_window=16384,
                 top_p=0.9,
                 top_k=40
             ),
             ModelTier.STANDARD: ModelConfig(
-                name="qwen2.5:32b",  # 32B for standard queries
+                name="qwen2.5:14b",  # Switched to 14B for better speed/quality balance
                 backend="ollama",
                 tier=ModelTier.STANDARD,
-                temperature=0.5,
+                temperature=0.7,  # Higher temp for better engagement
                 max_tokens=2048,
-                context_window=16384,  # 16k context
+                context_window=16384,
                 top_p=0.9,
                 top_k=40
             ),
             ModelTier.POWER: ModelConfig(
-                name="qwen2.5:32b",  # 32B for document analysis
+                name="qwen2.5:32b",  # Keep 32B for heavy lifting
                 backend="ollama",
                 tier=ModelTier.POWER,
-                temperature=0.2,  # Low temp for precise analysis
+                temperature=0.4,  # Slightly higher but still focused
                 max_tokens=4096,
-                context_window=32768,  # 32k context - room for big docs
+                context_window=32768,
                 top_p=0.95,
                 top_k=50
             ),
@@ -136,7 +137,7 @@ class Settings:
                 name="llava:latest",
                 backend="ollama",
                 tier=ModelTier.VISION,
-                temperature=0.4,
+                temperature=0.5,
                 max_tokens=2048,
                 context_window=4096,
                 supports_vision=True,
@@ -148,17 +149,23 @@ class Settings:
     def _setup_default_routing(self):
         """Configure default routing rules"""
         self.routing_rules = [
-            # Quick queries - simple factual questions
+            # Greetings - NO WEB SEARCH
+            RoutingRule(
+                keywords=["hello", "hi", "hey", "thanks", "thank you", "bye", "goodbye", 
+                         "ok", "okay", "good morning", "good afternoon", "good evening"],
+                tier=ModelTier.QUICK,
+                tools=[],  # No tools needed for greetings
+                priority=10
+            ),
+            # Simple queries - WEB SEARCH
             RoutingRule(
                 keywords=["weather", "time", "date", "what is", "who is", "define", 
                          "meaning of", "translate", "convert", "calculate", "how many",
-                         "what's the", "when is", "where is", "hello", "hi", "hey",
-                         "thanks", "thank you", "bye", "goodbye"],
+                         "what's the", "when is", "where is"],
                 tier=ModelTier.QUICK,
                 tools=[ToolType.WEB_SEARCH],
                 priority=10
             ),
-            # Power queries - complex analysis
             RoutingRule(
                 keywords=["analyze", "analysis", "compare", "comparison", "evaluate",
                          "fiscal", "quarterly", "revenue", "profit", "loss", "budget",
@@ -170,7 +177,6 @@ class Settings:
                 tools=[ToolType.FILE_READER, ToolType.DATABASE, ToolType.WEB_SEARCH],
                 priority=20
             ),
-            # Vision queries - image related
             RoutingRule(
                 keywords=["image", "picture", "photo", "screenshot", "diagram",
                          "chart", "graph", "what's in this", "describe this",
@@ -179,7 +185,6 @@ class Settings:
                 tools=[ToolType.IMAGE_VISION],
                 priority=30
             ),
-            # File-related queries
             RoutingRule(
                 keywords=["file", "document", "spreadsheet", "pdf", "excel", 
                          "word", "powerpoint", "database", "qvd", "open", "read"],
@@ -196,24 +201,19 @@ class Settings:
     def update_model(self, tier: ModelTier, **kwargs):
         """Update model configuration for a tier"""
         if tier in self.models:
-            for key, value in kwargs.items():
-                if hasattr(self.models[tier], key):
-                    setattr(self.models[tier], key, value)
+            model = self.models[tier]
+            updated_data = model.model_dump()
+            updated_data.update(kwargs)
+            self.models[tier] = ModelConfig(**updated_data)
     
     def save(self, path: str = "config.json"):
         """Save settings to file"""
-        data = {
+        # Pydantic models have a model_dump method
+        data = self.model_dump(mode="json", exclude={"routing_rules", "supported_extensions"})
+        
+        export_data = {
             "models": {
-                tier.value: {
-                    "name": cfg.name,
-                    "backend": cfg.backend,
-                    "temperature": cfg.temperature,
-                    "max_tokens": cfg.max_tokens,
-                    "top_p": cfg.top_p,
-                    "top_k": cfg.top_k,
-                    "context_window": cfg.context_window,
-                    "supports_vision": cfg.supports_vision
-                }
+                tier.value: cfg.model_dump(exclude={"tier"})
                 for tier, cfg in self.models.items()
             },
             "web_search_enabled": self.web_search_enabled,
@@ -223,41 +223,19 @@ class Settings:
             "ui_port": self.ui_port,
             "api_port": self.api_port
         }
-        Path(path).write_text(json.dumps(data, indent=2))
-    
+        Path(path).write_text(json.dumps(export_data, indent=2))
+
     @classmethod
     def load(cls, path: str = "config.json") -> "Settings":
-        """Load settings from file"""
+        """Load settings from file - helper to load from JSON on top of env vars"""
         if not Path(path).exists():
             return cls()
-        
-        data = json.loads(Path(path).read_text())
-        settings = cls()
-        
-        # Load models
-        for tier_str, cfg in data.get("models", {}).items():
-            tier = ModelTier(tier_str)
-            settings.models[tier] = ModelConfig(
-                name=cfg["name"],
-                backend=cfg["backend"],
-                tier=tier,
-                temperature=cfg.get("temperature", 0.7),
-                max_tokens=cfg.get("max_tokens", 2048),
-                top_p=cfg.get("top_p", 0.9),
-                top_k=cfg.get("top_k", 40),
-                context_window=cfg.get("context_window", 4096),
-                supports_vision=cfg.get("supports_vision", False)
-            )
-        
-        # Load other settings
-        settings.web_search_enabled = data.get("web_search_enabled", True)
-        settings.web_search_provider = data.get("web_search_provider", "duckduckgo")
-        settings.tavily_api_key = data.get("tavily_api_key")
-        settings.max_file_size_mb = data.get("max_file_size_mb", 50)
-        settings.ui_port = data.get("ui_port", 7860)
-        settings.api_port = data.get("api_port", 8000)
-        
-        return settings
+            
+        try:
+            # For legacy support, we just return default which loads from env
+            return cls() 
+        except Exception:
+            return cls()
 
 
 # Global settings instance

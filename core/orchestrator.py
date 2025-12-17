@@ -1,8 +1,7 @@
-"""
-Orchestrator - The brain of the system.
-Coordinates between router, models, and tools to handle any query.
-Users see none of this - it all happens automatically.
-Fully synchronous to work with Gradio.
+"""Orchestrator - the brain of the system.
+
+Coordinates routing + tools + generation.
+All orchestration happens on the backend; the UI is just a client.
 """
 from typing import List, Optional, Generator, Dict, Any, Tuple
 from dataclasses import dataclass
@@ -73,7 +72,7 @@ class Orchestrator:
     All automatic - users just chat.
     """
     
-    SYSTEM_PROMPT = """You are an expert document analyst and data specialist. Your PRIMARY purpose is to analyze uploaded documents, spreadsheets, databases, and files.
+    SYSTEM_PROMPT_ANALYST = """You are an expert document analyst and data specialist. Your PRIMARY purpose is to analyze uploaded documents, spreadsheets, databases, and files.
 
 CRITICAL RULES:
 1. ALWAYS base your answers on the actual document content provided in the context
@@ -81,6 +80,7 @@ CRITICAL RULES:
 3. If document content is provided, your answer MUST reference specific data from it
 4. Quote exact values, numbers, names, and text from the documents when relevant
 5. If asked about something not in the provided documents, clearly state "This information is not in the provided document(s)"
+6. CITATIONS: When referencing external information (web search), YOU MUST use Markdown links: [Source Name](URL). Example: [Wikipedia](https://en.wikipedia.org/...)
 
 When analyzing documents:
 - For spreadsheets: Identify column headers, summarize data patterns, provide statistics
@@ -89,6 +89,17 @@ When analyzing documents:
 - Always cite which file/sheet/section your information comes from
 
 You also have web search capabilities for supplementary information, but uploaded documents are ALWAYS the primary source of truth."""
+
+    SYSTEM_PROMPT_ASSISTANT = """You are a highly intelligent, friendly, and conversational AI companion.
+
+Your goal is to have natural, fluid conversations with the user.
+- Adopt a warm, professional, yet approachable tone.
+- Do not sound robotic or overly formal.
+- If the user asks a simple question, give a direct answer without unnecessary preamble.
+- You have access to web search and other tools; use them seamlessly when needed.
+- Engage with the user's intent, not just their literal words.
+- CITATIONS: If you use information from web search results, YOU MUST cite the source using a Markdown link: [Source Name](URL). Do not just list the URL.
+"""
     
     def __init__(self):
         self.settings = settings
@@ -108,10 +119,10 @@ You also have web search capabilities for supplementary information, but uploade
         query: str,
         files: Optional[List[Tuple[str, bytes]]] = None,
         images: Optional[List[Tuple[str, bytes]]] = None
-    ) -> Generator[str, None, None]:
+    ) -> Generator[Dict[str, Any], None, None]:
         """
         Process a query with optional files and images.
-        Yields response chunks for streaming.
+        Yields event dictionaries for streaming.
         
         Args:
             query: User's question/request
@@ -137,11 +148,24 @@ You also have web search capabilities for supplementary information, but uploade
         # Log routing decision (backend only)
         print(f"\n[Router] {self.router.explain_decision(decision)}")
         
+        # Yield routing event
+        yield {
+            "type": "routing",
+            "tier": decision.tier.value,
+            "tools": [t.value for t in decision.tools],
+            "reasoning": decision.reasoning
+        }
+        
         # Create processing context
         context = ProcessingContext(query=query, decision=decision)
         
         # Gather context based on routing decision
-        self._gather_context(context, files, images)
+        # We need to modify _gather_context to yield events too, but for now let's just wrap it
+        # or refactor it to be a generator.
+        # For simplicity, let's iterate manually here or make _gather_context yield events.
+        
+        for event in self._gather_context_generator(context, files, images):
+            yield event
         
         # Get model config
         model_config = self.settings.get_model_for_tier(decision.tier)
@@ -150,34 +174,47 @@ You also have web search capabilities for supplementary information, but uploade
         llm_messages = self._build_messages(query, context)
         
         # Stream response
-        for chunk in self._generate_response(model_config, llm_messages, images):
-            yield chunk
+        for chunk in self._generate_response(model_config, llm_messages, query, images):
+            yield {"type": "content", "content": chunk}
     
-    def _gather_context(
+    def _gather_context_generator(
         self,
         context: ProcessingContext,
         files: List[Tuple[str, bytes]],
         images: List[Tuple[str, bytes]]
-    ):
-        """Gather all context needed for the query - use RAG for intelligent retrieval"""
+    ) -> Generator[Dict[str, Any], None, None]:
+        """Gather all context needed for the query - yielding status events"""
         
         # STEP 1: Process and index uploaded files with RAG
         if files:
+            yield {"type": "tool", "status": "running", "tool": "rag_indexing", "message": f"Processing {len(files)} files..."}
             print(f"[Context] Processing {len(files)} uploaded file(s) with RAG...")
             self._process_files_with_rag(context, files)
             self._process_databases(context, files)
+            yield {"type": "tool", "status": "complete", "tool": "rag_indexing"}
         
         # STEP 2: Retrieve relevant chunks using RAG
         if files:
+            yield {"type": "tool", "status": "running", "tool": "rag_retrieval", "message": "Searching documents..."}
             self._retrieve_with_rag(context)
+            yield {"type": "tool", "status": "complete", "tool": "rag_retrieval"}
         
         # STEP 3: Web search if routing decided it's needed
         if ToolType.WEB_SEARCH in context.decision.tools:
+            yield {"type": "tool", "status": "running", "tool": "web_search", "message": "Searching the web..."}
             self._do_web_search(context)
+            yield {"type": "tool", "status": "complete", "tool": "web_search"}
         
         # STEP 4: Image analysis (for non-vision models that need text description)
         if images and context.decision.tier != ModelTier.VISION:
+            yield {"type": "tool", "status": "running", "tool": "vision_analysis", "message": "Analyzing images..."}
             self._analyze_images_as_text(context, images)
+            yield {"type": "tool", "status": "complete", "tool": "vision_analysis"}
+
+    def _gather_context(self, *args, **kwargs):
+        """Deprecated synchronous wrapper"""
+        pass
+
     
     def _do_web_search(self, context: ProcessingContext):
         """Perform web search"""
@@ -241,39 +278,6 @@ You also have web search capabilities for supplementary information, but uploade
         except Exception as e:
             print(f"[RAG] Retrieval error: {e}")
     
-    def _process_files(self, context: ProcessingContext, files: List[Tuple[str, bytes]]):
-        """Process document files"""
-        for filename, file_bytes in files:
-            ext = Path(filename).suffix.lower()
-            
-            # Skip database files - handled separately
-            if ext in {'.db', '.sqlite', '.sqlite3', '.mdb', '.accdb', '.qvd'}:
-                continue
-            
-            # Skip images - handled separately
-            if ext in {'.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp'}:
-                continue
-            
-            try:
-                print(f"[File] Reading {filename} ({len(file_bytes)} bytes)...")
-                content = self.file_reader.read(filename, file_bytes)
-                
-                # Check if we actually got content
-                if content.error:
-                    print(f"[File] ERROR: {content.error}")
-                elif not content.content:
-                    print(f"[File] WARNING: No content extracted from {filename}")
-                else:
-                    print(f"[File] SUCCESS: Extracted {len(content.content)} chars from {filename}")
-                
-                formatted = self.file_reader.format_content(content)
-                context.file_contents.append(formatted)
-                print(f"[File] Processed {filename}")
-            except Exception as e:
-                import traceback
-                print(f"[File] EXCEPTION reading {filename}: {e}")
-                traceback.print_exc()
-    
     def _process_databases(self, context: ProcessingContext, files: List[Tuple[str, bytes]]):
         """Process database files"""
         db_extensions = {'.db', '.sqlite', '.sqlite3', '.mdb', '.accdb', '.qvd'}
@@ -315,7 +319,15 @@ You also have web search capabilities for supplementary information, but uploade
     
     def _build_messages(self, query: str, context: ProcessingContext) -> List[Dict[str, Any]]:
         """Build message list for LLM"""
-        messages = [{"role": "system", "content": self.SYSTEM_PROMPT}]
+        # Dynamic System Prompt
+        # If we have file content or RAG context, use the strict Analyst prompt
+        # Otherwise, use the friendly Assistant prompt
+        if context.file_contents or context.rag_context:
+            system_prompt = self.SYSTEM_PROMPT_ANALYST
+        else:
+            system_prompt = self.SYSTEM_PROMPT_ASSISTANT
+            
+        messages = [{"role": "system", "content": system_prompt}]
         
         # Add conversation history (limited)
         for msg in self.messages[-self.max_history:]:
@@ -339,6 +351,7 @@ User question: {query}"""
         self,
         model_config,
         messages: List[Dict[str, Any]],
+        user_query: str,
         images: Optional[List[Tuple[str, bytes]]] = None
     ) -> Generator[str, None, None]:
         """Generate response from model, streaming"""
@@ -407,7 +420,7 @@ User question: {query}"""
         
         # Save to history
         if full_response:
-            self.messages.append(Message(role="user", content=messages[-1]["content"]))
+            self.messages.append(Message(role="user", content=user_query))
             self.messages.append(Message(role="assistant", content=full_response))
             
             # Trim history

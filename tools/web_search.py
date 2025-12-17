@@ -1,7 +1,6 @@
-"""
-Web Search Tool - Automatic web search without user interaction.
+"""Web Search Tool - automatic web search without user interaction.
+
 Uses DuckDuckGo (free) or Tavily API for search.
-Fully synchronous to avoid event loop issues with Gradio.
 """
 from typing import List
 from dataclasses import dataclass
@@ -24,7 +23,7 @@ class WebSearchTool:
     """
     Performs web searches automatically when queries need current information.
     No user interaction required - the router decides when to search.
-    All methods are synchronous to work properly with Gradio.
+    All methods are synchronous.
     """
     
     def __init__(self):

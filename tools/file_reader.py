@@ -401,14 +401,3 @@ class FileReaderTool:
             content=content,
             metadata={'chars': len(content)}
         )
-    
-    def format_content(self, file_content: FileContent) -> str:
-        """Format file content for LLM context"""
-        if file_content.error:
-            return f"[Error reading {file_content.filename}]: {file_content.error}"
-        
-        header = f"[File: {file_content.filename}]"
-        if file_content.page_count:
-            header += f" ({file_content.page_count} pages)"
-        
-        return f"{header}\n{file_content.content}"

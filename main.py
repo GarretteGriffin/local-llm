@@ -1,12 +1,13 @@
-"""
-AI Assistant - Intelligent Local LLM Application
+"""AI Assistant - Intelligent Local LLM Application.
 
-A ChatGPT-like experience running entirely on your machine.
+Runs entirely local using Ollama.
+
+Backend features:
 - Automatic model selection based on query complexity
-- Automatic web search for current information
+- Automatic web search for current information (supplemental)
 - Document reading (Office, PDF, databases, QVD)
 - Image understanding
-- All settings controlled from backend - users see clean interface
+- All settings controlled from backend
 """
 import argparse
 import sys
@@ -16,7 +17,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 
 from config import settings
-from ui import launch_ui
+from core.logging import setup_logging
 
 
 def check_ollama():
@@ -47,7 +48,7 @@ def print_banner():
     banner = """
     ╔═══════════════════════════════════════════════════════════════╗
     ║                                                               ║
-    ║   🤖 AI Assistant - Intelligent Local LLM                     ║
+    ║   AI Assistant - Intelligent Local LLM                        ║
     ║                                                               ║
     ║   Features:                                                   ║
     ║   • Automatic model selection (quick/standard/power)          ║
@@ -66,7 +67,7 @@ def print_banner():
 
 def print_model_status(installed_models):
     """Print model installation status"""
-    print("\n📊 Model Configuration:")
+    print("\nModel Configuration:")
     print("-" * 50)
     
     for tier, config in settings.models.items():
@@ -80,7 +81,7 @@ def print_model_status(installed_models):
             any(base_name in m for m in installed_models)
         )
         
-        status = "✅ Installed" if is_installed else "❌ Not installed"
+        status = "Installed" if is_installed else "Not installed"
         print(f"   {tier.value.upper():10} → {name:20} {status}")
     
     print("-" * 50)
@@ -104,7 +105,7 @@ def suggest_model_installation(installed_models):
             missing.append((tier, config.name))
     
     if missing:
-        print("\n💡 To install missing models, run:")
+        print("\nTo install missing models, run:")
         for tier, name in missing:
             print(f"   ollama pull {name}")
         print()
@@ -114,23 +115,23 @@ def main():
     """Main entry point"""
     parser = argparse.ArgumentParser(description="AI Assistant - Intelligent Local LLM")
     parser.add_argument("--port", type=int, default=7860, help="UI port (default: 7860)")
-    parser.add_argument("--share", action="store_true", help="Create public URL")
     parser.add_argument("--check", action="store_true", help="Check model status and exit")
     args = parser.parse_args()
     
+    setup_logging()
     print_banner()
     
     # Check Ollama
     if not check_ollama():
-        print("❌ Ollama is not running!")
+        print("Ollama is not running.")
         print("   Please start Ollama first: https://ollama.ai")
         sys.exit(1)
     
-    print("✅ Ollama is running")
+    print("Ollama is running")
     
     # Check models
     installed = check_models()
-    print(f"✅ Found {len(installed)} installed models")
+    print(f"Found {len(installed)} installed models")
     
     print_model_status(installed)
     suggest_model_installation(installed)
@@ -139,10 +140,13 @@ def main():
         sys.exit(0)
     
     # Launch UI
-    print(f"\n🚀 Starting AI Assistant on http://localhost:{args.port}")
+    print(f"\nStarting AI Assistant on http://localhost:{args.port}")
     print("   Press Ctrl+C to stop\n")
-    
-    launch_ui(share=args.share, server_port=args.port)
+
+    import uvicorn
+    from server.app import app
+
+    uvicorn.run(app, host="0.0.0.0", port=args.port, log_level="info")
 
 
 if __name__ == "__main__":
