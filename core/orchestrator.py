@@ -10,6 +10,7 @@ import httpx
 import json
 
 from config import settings, ModelTier, ToolType
+from config.admin_overrides import get_model_overrides, get_system_prompt, get_tool_override
 from core.router import QueryRouter, RoutingDecision
 from tools import WebSearchTool, FileReaderTool, VisionTool, DatabaseTool, RAGTool
 
@@ -167,8 +168,8 @@ Your goal is to have natural, fluid conversations with the user.
         for event in self._gather_context_generator(context, files, images):
             yield event
         
-        # Get model config
-        model_config = self.settings.get_model_for_tier(decision.tier)
+        # Get model config (supports admin-managed runtime overrides)
+        model_config = self._get_effective_model_config(decision.tier)
         
         # Build messages for LLM
         llm_messages = self._build_messages(query, context)
@@ -202,14 +203,28 @@ Your goal is to have natural, fluid conversations with the user.
                 yield {"type": "sources", "sources": rag_sources, "merge": True}
             yield {"type": "tool", "status": "complete", "tool": "rag_retrieval"}
         
-        # STEP 3: Web search if routing decided it's needed
-        if ToolType.WEB_SEARCH in context.decision.tools:
+        # STEP 3: Web search if routing decided it's needed (and not globally disabled)
+        web_search_enabled_override = get_tool_override("web_search_enabled")
+        web_search_enabled = (
+            bool(web_search_enabled_override)
+            if isinstance(web_search_enabled_override, bool)
+            else True
+        )
+
+        if ToolType.WEB_SEARCH in context.decision.tools and web_search_enabled:
             yield {"type": "tool", "status": "running", "tool": "web_search", "message": "Searching the web..."}
             results = self._do_web_search(context)
             web_sources = self._build_web_sources(results)
             if web_sources:
                 yield {"type": "sources", "sources": web_sources, "merge": True}
             yield {"type": "tool", "status": "complete", "tool": "web_search"}
+        elif ToolType.WEB_SEARCH in context.decision.tools and not web_search_enabled:
+            yield {
+                "type": "tool",
+                "status": "skipped",
+                "tool": "web_search",
+                "message": "Web search is disabled by administrator."
+            }
         
         # STEP 4: Image analysis (for non-vision models that need text description)
         if images and context.decision.tier != ModelTier.VISION:
@@ -385,10 +400,12 @@ Your goal is to have natural, fluid conversations with the user.
         # Dynamic System Prompt
         # If we have file content or RAG context, use the strict Analyst prompt
         # Otherwise, use the friendly Assistant prompt
-        if context.file_contents or context.rag_context:
-            system_prompt = self.SYSTEM_PROMPT_ANALYST
-        else:
-            system_prompt = self.SYSTEM_PROMPT_ASSISTANT
+        analyst_mode = bool(context.file_contents or context.rag_context)
+        system_prompt = get_system_prompt(
+            analyst=analyst_mode,
+            default_assistant=self.SYSTEM_PROMPT_ASSISTANT,
+            default_analyst=self.SYSTEM_PROMPT_ANALYST,
+        )
             
         messages = [{"role": "system", "content": system_prompt}]
         
@@ -409,6 +426,32 @@ User question: {query}"""
         messages.append({"role": "user", "content": user_content})
         
         return messages
+
+    def _get_effective_model_config(self, tier: ModelTier):
+        """Return a ModelConfig with admin overrides applied (without mutating global settings)."""
+        base = self.settings.get_model_for_tier(tier)
+        overrides = get_model_overrides().get(tier.value)
+        if not overrides:
+            return base
+
+        # Only allow overriding safe, expected fields.
+        allowed_keys = {
+            "name",
+            "temperature",
+            "max_tokens",
+            "top_p",
+            "top_k",
+            "context_window",
+        }
+        safe_updates = {k: v for k, v in overrides.items() if k in allowed_keys}
+        if not safe_updates:
+            return base
+
+        merged = base.model_dump()
+        merged.update(safe_updates)
+        # Ensure tier stays consistent
+        merged["tier"] = tier
+        return type(base)(**merged)
     
     def _generate_response(
         self,

@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Local LLM Admin</title>
+  <link rel="stylesheet" href="/ui-static/styles.css?v=20251218" />
+  <link rel="stylesheet" href="/static/styles.css?v=20251218" />
+</head>
+<body>
+  <div class="page">
+    <div class="card app">
+      <header class="header">
+        <div>
+          <div class="title">Local LLM Admin</div>
+          <div class="subtitle">Enterprise configuration (instructions + settings)</div>
+        </div>
+        <div style="display:flex; gap:8px; align-items:center;">
+          <button id="refreshBtn" class="btn">Refresh</button>
+          <button id="saveBtn" class="btn primary">Save</button>
+          <button id="resetBtn" class="btn danger">Reset overrides</button>
+        </div>
+      </header>
+
+      <main class="main" style="padding: 16px; overflow:auto;">
+        <div id="status" class="hint" style="margin-bottom: 12px;"></div>
+
+        <section class="panel" style="margin-bottom: 16px;">
+          <h3 style="margin: 0 0 10px 0;">System instructions</h3>
+
+          <label class="hint" for="assistantPrompt">Assistant prompt (no files)</label>
+          <textarea id="assistantPrompt" rows="8" style="width:100%;"></textarea>
+
+          <div style="height: 10px;"></div>
+
+          <label class="hint" for="analystPrompt">Analyst prompt (files/RAG)</label>
+          <textarea id="analystPrompt" rows="10" style="width:100%;"></textarea>
+        </section>
+
+        <section class="panel" style="margin-bottom: 16px;">
+          <h3 style="margin: 0 0 10px 0;">Models</h3>
+          <div class="hint" style="margin-bottom: 8px;">Override only what you need; blank means “use base”.</div>
+
+          <div id="modelsGrid"></div>
+        </section>
+
+        <section class="panel">
+          <h3 style="margin: 0 0 10px 0;">Tools</h3>
+          <label style="display:flex; gap:10px; align-items:center;">
+            <input id="webSearchEnabled" type="checkbox" />
+            <span>Enable web search</span>
+          </label>
+        </section>
+      </main>
+    </div>
+  </div>
+
+  <script src="/static/app.js?v=20251218"></script>
+</body>
+</html>

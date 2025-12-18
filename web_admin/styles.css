@@ -1,0 +1,29 @@
+/* Minimal admin styles.
+   Intentionally light to avoid diverging from the main UI.
+*/
+
+textarea, input[type="text"], input[type="number"] {
+  font: inherit;
+  padding: 10px;
+  border-radius: 10px;
+  border: 1px solid currentColor;
+  opacity: 0.95;
+  width: 100%;
+  box-sizing: border-box;
+}
+
+textarea { resize: vertical; }
+
+.model-row {
+  display: grid;
+  grid-template-columns: 120px 1.5fr 0.6fr 0.7fr 0.6fr 0.6fr 0.7fr;
+  gap: 8px;
+  align-items: center;
+  margin-bottom: 8px;
+}
+
+.model-row .tier {
+  font-weight: 600;
+}
+
+.hint { opacity: 0.75; font-size: 12px; }
