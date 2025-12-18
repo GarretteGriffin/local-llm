@@ -196,13 +196,19 @@ Your goal is to have natural, fluid conversations with the user.
         # STEP 2: Retrieve relevant chunks using RAG
         if files:
             yield {"type": "tool", "status": "running", "tool": "rag_retrieval", "message": "Searching documents..."}
-            self._retrieve_with_rag(context)
+            result = self._retrieve_with_rag(context)
+            rag_sources = self._build_rag_sources(result)
+            if rag_sources:
+                yield {"type": "sources", "sources": rag_sources, "merge": True}
             yield {"type": "tool", "status": "complete", "tool": "rag_retrieval"}
         
         # STEP 3: Web search if routing decided it's needed
         if ToolType.WEB_SEARCH in context.decision.tools:
             yield {"type": "tool", "status": "running", "tool": "web_search", "message": "Searching the web..."}
-            self._do_web_search(context)
+            results = self._do_web_search(context)
+            web_sources = self._build_web_sources(results)
+            if web_sources:
+                yield {"type": "sources", "sources": web_sources, "merge": True}
             yield {"type": "tool", "status": "complete", "tool": "web_search"}
         
         # STEP 4: Image analysis (for non-vision models that need text description)
@@ -222,8 +228,10 @@ Your goal is to have natural, fluid conversations with the user.
             results = self.web_search.search(context.query)
             context.web_results = self.web_search.format_results(results)
             print(f"[Web Search] Found {len(results)} results")
+            return results
         except Exception as e:
             print(f"[Web Search] Error: {e}")
+            return []
     
     def _process_files_with_rag(self, context: ProcessingContext, files: List[Tuple[str, bytes]]):
         """Process document files and index them with RAG"""
@@ -275,8 +283,63 @@ Your goal is to have natural, fluid conversations with the user.
                 print(f"[RAG] Retrieved {len(result.chunks)} relevant chunks from {result.source_files}")
             else:
                 print(f"[RAG] No relevant chunks found")
+            return result
         except Exception as e:
             print(f"[RAG] Retrieval error: {e}")
+            return None
+
+    def _build_web_sources(self, results) -> List[Dict[str, Any]]:
+        """Normalize web search results into UI-friendly sources."""
+        sources: List[Dict[str, Any]] = []
+        for r in (results or []):
+            url = getattr(r, "url", "") or ""
+            if not url:
+                continue
+            title = (getattr(r, "title", "") or "").strip()
+            snippet = (getattr(r, "snippet", "") or "").strip()
+            src = (getattr(r, "source", "") or "").strip()
+            sources.append(
+                {
+                    "kind": "web",
+                    "href": url,
+                    "label": title or url,
+                    "snippet": snippet,
+                    "source": src,
+                }
+            )
+        return sources
+
+    def _build_rag_sources(self, result) -> List[Dict[str, Any]]:
+        """Normalize RAG retrieval results into UI-friendly sources."""
+        sources: List[Dict[str, Any]] = []
+        if not result or not getattr(result, "chunks", None):
+            return sources
+
+        # De-dupe by (filename, chunk_num) while preserving order.
+        seen = set()
+        for chunk in result.chunks:
+            meta = getattr(chunk, "metadata", {}) or {}
+            filename = meta.get("filename") or "document"
+            chunk_num = meta.get("chunk_num")
+            key = (filename, chunk_num)
+            if key in seen:
+                continue
+            seen.add(key)
+            label = f"{filename}"
+            if chunk_num is not None:
+                label = f"{filename} (section {chunk_num})"
+            sources.append(
+                {
+                    "kind": "document",
+                    "href": "",
+                    "label": label,
+                    "filename": filename,
+                    "chunk_id": getattr(chunk, "chunk_id", ""),
+                    "chunk_num": chunk_num,
+                }
+            )
+
+        return sources
     
     def _process_databases(self, context: ProcessingContext, files: List[Tuple[str, bytes]]):
         """Process database files"""

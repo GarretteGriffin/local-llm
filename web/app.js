@@ -123,7 +123,9 @@ function renderSources(detailsEl, sources) {
   const items = sources
     .map(
       (s) =>
-        `<li><a href="${s.href}" target="_blank" rel="noopener noreferrer">${s.label}</a></li>`,
+        s.href
+          ? `<li><a href="${s.href}" target="_blank" rel="noopener noreferrer">${s.label}</a></li>`
+          : `<li><span>${s.label}</span></li>`,
     )
     .join('');
   detailsEl.innerHTML = `<summary>Sources</summary><ol>${items}</ol>`;
@@ -201,6 +203,9 @@ async function send() {
   const botDiv = addMessage('bot');
   const botContentEl = botDiv.querySelector('.content');
   const botSourcesEl = botDiv.querySelector('.sources');
+  const structuredSources = [];
+  const structuredSourceKeys = new Set();
+  let hasStructuredSources = false;
 
   messageEl.value = '';
   messageEl.style.height = 'auto';
@@ -271,9 +276,28 @@ async function send() {
               botContentEl.innerHTML = marked.parse(displayContent);
               linkifyElement(botContentEl);
               setAnchorBehavior(botContentEl);
-              renderSources(botSourcesEl, extractSources(botContentEl));
+              renderSources(
+                botSourcesEl,
+                hasStructuredSources ? structuredSources : extractSources(botContentEl),
+              );
             }
             break;
+          case 'sources': {
+            const incoming = Array.isArray(payload.sources) ? payload.sources : [];
+            for (const s of incoming) {
+              if (!s) continue;
+              const href = typeof s.href === 'string' ? s.href : '';
+              const label = (typeof s.label === 'string' ? s.label : '').trim();
+              const key = `${href}|${label}`;
+              if (!label) continue;
+              if (structuredSourceKeys.has(key)) continue;
+              structuredSourceKeys.add(key);
+              structuredSources.push({ href, label });
+            }
+            hasStructuredSources = structuredSources.length > 0;
+            renderSources(botSourcesEl, structuredSources);
+            break;
+          }
           case 'content':
             if (!payload.content) break;
             fullContent += payload.content;
@@ -282,7 +306,10 @@ async function send() {
               botContentEl.innerHTML = marked.parse(displayContent);
               linkifyElement(botContentEl);
               setAnchorBehavior(botContentEl);
-              renderSources(botSourcesEl, extractSources(botContentEl));
+              renderSources(
+                botSourcesEl,
+                hasStructuredSources ? structuredSources : extractSources(botContentEl),
+              );
             }
             break;
           default:
