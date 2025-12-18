@@ -1,4 +1,5 @@
 ﻿let sessionId = null;
+let activeConversationId = null;
 
 const chatEl = document.getElementById('chat');
 const messageEl = document.getElementById('message');
@@ -9,6 +10,90 @@ const fileInput = document.getElementById('fileInput');
 const attachmentsEl = document.getElementById('attachments');
 const toolStatusEl = document.getElementById('tool-status');
 const toolTextEl = document.querySelector('.tool-text');
+const convoListEl = document.getElementById('convoList');
+const newChatBtn = document.getElementById('newChatBtn');
+const activityListEl = document.getElementById('activityList');
+const clearActivityBtn = document.getElementById('clearActivityBtn');
+
+const STORAGE_KEY = 'local-llm-conversations-v1';
+
+function nowIso() {
+  return new Date().toISOString();
+}
+
+function makeId() {
+  if (crypto && crypto.randomUUID) return crypto.randomUUID();
+  return `c_${Math.random().toString(16).slice(2)}_${Date.now()}`;
+}
+
+function loadConversations() {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    const convos = raw ? JSON.parse(raw) : [];
+    return Array.isArray(convos) ? convos : [];
+  } catch {
+    return [];
+  }
+}
+
+function saveConversations(conversations) {
+  try {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(conversations || []));
+  } catch {
+    // ignore
+  }
+}
+
+function getConversation(conversationId) {
+  return loadConversations().find((c) => c.id === conversationId) || null;
+}
+
+function upsertConversation(conversation) {
+  const conversations = loadConversations();
+  const idx = conversations.findIndex((c) => c.id === conversation.id);
+  if (idx >= 0) conversations[idx] = conversation;
+  else conversations.unshift(conversation);
+  saveConversations(conversations);
+}
+
+function deleteConversation(conversationId) {
+  const conversations = loadConversations().filter((c) => c.id !== conversationId);
+  saveConversations(conversations);
+}
+
+function setActiveConversation(conversationId) {
+  activeConversationId = conversationId;
+  const convo = getConversation(conversationId);
+  sessionId = convo ? convo.sessionId || null : null;
+  renderConversationList();
+  renderConversation(convo);
+}
+
+function ensureActiveConversation(seedTitle) {
+  if (activeConversationId) return getConversation(activeConversationId);
+
+  const conversation = {
+    id: makeId(),
+    title: (seedTitle || 'New chat').slice(0, 80),
+    sessionId: null,
+    createdAt: nowIso(),
+    updatedAt: nowIso(),
+    messages: [],
+  };
+  upsertConversation(conversation);
+  setActiveConversation(conversation.id);
+  return conversation;
+}
+
+function summarizeTitle(text) {
+  const t = String(text || '').trim();
+  if (!t) return 'New chat';
+  return t.length > 48 ? `${t.slice(0, 48)}…` : t;
+}
+
+function scrollToBottom() {
+  chatEl.scrollTop = chatEl.scrollHeight;
+}
 
 function normalizeMarkdownLinks(text) {
   // Fix common streaming/newline breaks that split markdown link syntax.
@@ -162,8 +247,97 @@ function addMessage(role, text = '') {
     div.textContent = text;
   }
   chatEl.appendChild(div);
-  chatEl.scrollTop = chatEl.scrollHeight;
+  scrollToBottom();
   return div;
+}
+
+function renderConversation(conversation) {
+  chatEl.innerHTML = '';
+  if (!conversation || !Array.isArray(conversation.messages)) {
+    return;
+  }
+  for (const m of conversation.messages) {
+    addMessage(m.role, m.text || '');
+  }
+  scrollToBottom();
+}
+
+function renderConversationList() {
+  if (!convoListEl) return;
+  const conversations = loadConversations();
+  convoListEl.innerHTML = '';
+
+  for (const c of conversations) {
+    const item = document.createElement('div');
+    item.className = `convo-item${c.id === activeConversationId ? ' active' : ''}`;
+    item.setAttribute('role', 'listitem');
+
+    const title = document.createElement('div');
+    title.className = 'convo-title';
+    title.textContent = c.title || 'New chat';
+
+    const del = document.createElement('button');
+    del.className = 'convo-delete';
+    del.type = 'button';
+    del.textContent = '×';
+    del.setAttribute('aria-label', 'Delete conversation');
+
+    item.addEventListener('click', () => setActiveConversation(c.id));
+    del.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const wasActive = c.id === activeConversationId;
+      deleteConversation(c.id);
+      if (wasActive) {
+        activeConversationId = null;
+        sessionId = null;
+        chatEl.innerHTML = '';
+      }
+      const remaining = loadConversations();
+      if (wasActive && remaining.length) {
+        setActiveConversation(remaining[0].id);
+      } else {
+        renderConversationList();
+      }
+    });
+
+    item.appendChild(title);
+    item.appendChild(del);
+    convoListEl.appendChild(item);
+  }
+}
+
+function appendActivity(entry) {
+  if (!activityListEl) return;
+  const div = document.createElement('div');
+  div.className = 'activity-item';
+
+  const top = document.createElement('div');
+  top.className = 'activity-top';
+
+  const name = document.createElement('div');
+  name.className = 'activity-name';
+  name.textContent = entry.name || 'activity';
+
+  const status = document.createElement('div');
+  status.className = 'activity-status';
+  status.textContent = entry.status || '';
+
+  const msg = document.createElement('div');
+  msg.className = 'activity-msg';
+  msg.textContent = entry.message || '';
+
+  top.appendChild(name);
+  top.appendChild(status);
+  div.appendChild(top);
+  if (entry.message) div.appendChild(msg);
+
+  activityListEl.prepend(div);
+
+  // Keep the list from growing unbounded.
+  const max = 50;
+  while (activityListEl.childElementCount > max) {
+    activityListEl.removeChild(activityListEl.lastElementChild);
+  }
 }
 
 function renderAttachments() {
@@ -181,7 +355,33 @@ clearBtn.addEventListener('click', () => {
   fileInput.value = '';
   renderAttachments();
   hideTool();
+
+  if (activeConversationId) {
+    const convo = getConversation(activeConversationId);
+    if (convo) {
+      convo.messages = [];
+      convo.updatedAt = nowIso();
+      upsertConversation(convo);
+    }
+  }
 });
+
+if (newChatBtn) {
+  newChatBtn.addEventListener('click', () => {
+    activeConversationId = null;
+    sessionId = null;
+    chatEl.innerHTML = '';
+    messageEl.focus();
+    renderConversationList();
+  });
+}
+
+if (clearActivityBtn) {
+  clearActivityBtn.addEventListener('click', () => {
+    if (activityListEl) activityListEl.innerHTML = '';
+  });
+}
+
 
 function cleanText(text) {
   return text
@@ -199,6 +399,15 @@ async function send() {
   const files = Array.from(fileInput.files || []);
   if (!text && files.length === 0) return;
 
+  const convo = ensureActiveConversation(summarizeTitle(text || '(files attached)'));
+  if (!convo.title || convo.title === 'New chat') {
+    convo.title = summarizeTitle(text || '(files attached)');
+  }
+  convo.updatedAt = nowIso();
+  convo.messages.push({ role: 'user', text: text || '(files attached)', ts: nowIso() });
+  upsertConversation(convo);
+  renderConversationList();
+
   addMessage('user', text || '(files attached)');
   const botDiv = addMessage('bot');
   const botContentEl = botDiv.querySelector('.content');
@@ -206,6 +415,17 @@ async function send() {
   const structuredSources = [];
   const structuredSourceKeys = new Set();
   let hasStructuredSources = false;
+
+  let botMessageIndex = null;
+  {
+    const current = getConversation(activeConversationId);
+    if (current) {
+      current.messages.push({ role: 'bot', text: '', ts: nowIso() });
+      botMessageIndex = current.messages.length - 1;
+      current.updatedAt = nowIso();
+      upsertConversation(current);
+    }
+  }
 
   messageEl.value = '';
   messageEl.style.height = 'auto';
@@ -259,12 +479,27 @@ async function send() {
         switch (payload.type) {
           case 'session':
             sessionId = payload.session_id;
+            {
+              const current = getConversation(activeConversationId);
+              if (current && !current.sessionId) {
+                current.sessionId = sessionId;
+                current.updatedAt = nowIso();
+                upsertConversation(current);
+                renderConversationList();
+              }
+            }
             break;
           case 'tool':
             if (payload.status === 'running') {
               showTool(payload.tool, payload.message);
+              appendActivity({
+                name: payload.tool || 'tool',
+                status: 'running',
+                message: payload.message || '',
+              });
             } else {
               hideTool();
+              appendActivity({ name: payload.tool || 'tool', status: 'complete', message: '' });
             }
             break;
           case 'routing':
@@ -281,6 +516,15 @@ async function send() {
                 hasStructuredSources ? structuredSources : extractSources(botContentEl),
               );
             }
+
+            {
+              const current = getConversation(activeConversationId);
+              if (current && botMessageIndex != null && current.messages[botMessageIndex]) {
+                current.messages[botMessageIndex].text = fullContent;
+                current.updatedAt = nowIso();
+                upsertConversation(current);
+              }
+            }
             break;
           case 'sources': {
             const incoming = Array.isArray(payload.sources) ? payload.sources : [];
@@ -296,6 +540,11 @@ async function send() {
             }
             hasStructuredSources = structuredSources.length > 0;
             renderSources(botSourcesEl, structuredSources);
+            appendActivity({
+              name: 'sources',
+              status: 'updated',
+              message: `${structuredSources.length} source(s)`,
+            });
             break;
           }
           case 'content':
@@ -311,12 +560,21 @@ async function send() {
                 hasStructuredSources ? structuredSources : extractSources(botContentEl),
               );
             }
+
+            {
+              const current = getConversation(activeConversationId);
+              if (current && botMessageIndex != null && current.messages[botMessageIndex]) {
+                current.messages[botMessageIndex].text = fullContent;
+                current.updatedAt = nowIso();
+                upsertConversation(current);
+              }
+            }
             break;
           default:
             break;
         }
 
-        chatEl.scrollTop = chatEl.scrollHeight;
+        scrollToBottom();
       }
     }
   } catch (err) {
@@ -333,3 +591,12 @@ messageEl.addEventListener('keydown', (event) => {
     send();
   }
 });
+
+// Initial render
+renderConversationList();
+{
+  const conversations = loadConversations();
+  if (conversations.length) {
+    setActiveConversation(conversations[0].id);
+  }
+}

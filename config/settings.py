@@ -97,6 +97,29 @@ class Settings(BaseSettings):
     session_ttl_seconds: int = 60 * 60 * 4  # 4 hours
     session_cleanup_interval_seconds: int = 60  # 1 minute
     session_max_sessions: int = 500
+
+    # Enterprise Authentication (Microsoft Entra ID / Azure AD)
+    # Disabled by default for local/dev; enable via AUTH_ENABLED=true
+    auth_enabled: bool = False
+    auth_cookie_name: str = "auth_session"
+    auth_cookie_secure: Optional[bool] = None  # auto-detect; set true behind HTTPS
+
+    azure_tenant_id: Optional[str] = None
+    azure_client_id: Optional[str] = None
+    azure_client_secret: Optional[str] = None
+    azure_redirect_uri: Optional[str] = None
+
+    # Allow-list controls (optional)
+    auth_allowed_tenant_ids: List[str] = Field(default_factory=list)
+    auth_allowed_emails: List[str] = Field(default_factory=list)
+
+    # Server-side auth session store
+    auth_session_ttl_seconds: int = 60 * 60 * 8  # 8 hours
+    auth_session_cleanup_interval_seconds: int = 60
+    auth_session_max_sessions: int = 2000
+
+    # OAuth state storage (used by Authlib in SessionMiddleware)
+    session_middleware_secret_key: Optional[str] = None
     
     def model_post_init(self, __context: Any) -> None:
         """Initialize default models and routing rules if not set"""

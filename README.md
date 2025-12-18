@@ -57,6 +57,48 @@ ollama pull nomic-embed-text
 
 4. Open http://localhost:7860
 
+## Enterprise Authentication (Microsoft Entra ID)
+
+This project supports a **proper** Microsoft Entra ID (Azure AD) OAuth2/OIDC **Authorization Code** login flow using a **client secret**.
+
+### 1) Create an App Registration
+
+- Azure Portal → Microsoft Entra ID → App registrations → New registration
+- Set a redirect URI:
+  - Local dev: `http://localhost:7860/auth/callback`
+  - Production: `https://YOUR_DOMAIN/auth/callback`
+- Create a **Client Secret** (Certificates & secrets)
+
+### 2) Configure environment variables
+
+Create a `.env` file (not committed) or set these environment variables:
+
+- `AUTH_ENABLED=true`
+- `SESSION_MIDDLEWARE_SECRET_KEY=...` (random long string; used to sign OAuth state)
+- `AZURE_TENANT_ID=...`
+- `AZURE_CLIENT_ID=...`
+- `AZURE_CLIENT_SECRET=...`
+- `AZURE_REDIRECT_URI=...` (recommended for production)
+
+Optional allow-lists:
+
+- `AUTH_ALLOWED_TENANT_IDS=["<tenant-guid>"]`
+- `AUTH_ALLOWED_EMAILS=["user@company.com"]`
+
+### 3) Behavior
+
+- When enabled, `/` redirects to `/auth/login` until authenticated.
+- `/chat/stream` requires authentication (401 if not logged in).
+
+## Exposing to the Internet (Recommended)
+
+For an enterprise setup, host behind **HTTPS** on a managed platform (e.g., Azure App Service / Azure Container Apps) and set:
+
+- `AUTH_ENABLED=true`
+- `AZURE_REDIRECT_URI=https://YOUR_DOMAIN/auth/callback`
+
+If running behind a reverse proxy, ensure it forwards `X-Forwarded-Proto: https`.
+
 ## License
 
 MIT License

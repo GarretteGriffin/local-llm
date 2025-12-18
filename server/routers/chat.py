@@ -1,8 +1,9 @@
 from typing import List, Optional, Tuple, AsyncGenerator
-from fastapi import APIRouter, File, Form, UploadFile
+from fastapi import APIRouter, Depends, File, Form, UploadFile
 from fastapi.responses import StreamingResponse
 from starlette.concurrency import iterate_in_threadpool
 from server.dependencies import get_session
+from server.auth import require_current_user
 import json
 import logging
 
@@ -31,6 +32,7 @@ async def chat_stream(
     message: str = Form(""),
     session_id: Optional[str] = Form(None),
     files: Optional[List[UploadFile]] = File(None),
+    _user: dict = Depends(require_current_user),
 ) -> StreamingResponse:
     """
     Stream chat response.
