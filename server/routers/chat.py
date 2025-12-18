@@ -1,12 +1,30 @@
-from typing import List, Optional, Tuple, Generator
+from typing import List, Optional, Tuple, AsyncGenerator
 from fastapi import APIRouter, File, Form, UploadFile
 from fastapi.responses import StreamingResponse
+from starlette.concurrency import iterate_in_threadpool
 from server.dependencies import get_session
 import json
 import logging
 
 router = APIRouter(prefix="/chat", tags=["chat"])
 logger = logging.getLogger(__name__)
+
+
+def _looks_like_image_bytes(data: bytes) -> bool:
+    """Best-effort file sniffing for common image types (no external deps)."""
+    if not data:
+        return False
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return True
+    if data.startswith(b"\xff\xd8\xff"):
+        return True
+    if data.startswith(b"GIF87a") or data.startswith(b"GIF89a"):
+        return True
+    if data.startswith(b"BM"):
+        return True
+    if len(data) >= 12 and data.startswith(b"RIFF") and data[8:12] == b"WEBP":
+        return True
+    return False
 
 @router.post("/stream")
 async def chat_stream(
@@ -30,7 +48,7 @@ async def chat_stream(
             filename = uf.filename or "upload"
             content = await uf.read()
             lower = filename.lower()
-            if lower.endswith((".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp")):
+            if _looks_like_image_bytes(content) or lower.endswith((".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp")):
                 image_files.append((filename, content))
             else:
                 doc_files.append((filename, content))
@@ -38,19 +56,20 @@ async def chat_stream(
     def _sse(payload: dict) -> bytes:
         return f"data: {json.dumps(payload)}\n\n".encode("utf-8")
 
-    async def event_generator() -> Generator[bytes, None, None]:
+    async def event_generator() -> AsyncGenerator[bytes, None]:
         # Send session ID first
         yield _sse({"type": "session", "session_id": sid})
 
         try:
-            # Note: Orchestrator.process is synchronous generator currently.
-            # In a true enterprise app, we'd want this to be async or run in a threadpool.
-            # For now, we iterate the generator.
-            for event in state.orchestrator.process(
+            # Orchestrator.process is a synchronous generator; iterate it in a threadpool
+            # so we don't block the FastAPI event loop.
+            iterator = state.orchestrator.process(
                 query=message,
                 files=doc_files if doc_files else None,
                 images=image_files if image_files else None,
-            ):
+            )
+
+            async for event in iterate_in_threadpool(iterator):
                 # All events now stream as JSON payloads
                 if event.get("type") == "content":
                     event["content"] = event["content"].replace("\r", "")

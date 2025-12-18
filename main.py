@@ -12,6 +12,7 @@ Backend features:
 import argparse
 import sys
 from pathlib import Path
+import logging
 
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent))
@@ -19,14 +20,18 @@ sys.path.insert(0, str(Path(__file__).parent))
 from config import settings
 from core.logging import setup_logging
 
+logger = logging.getLogger(__name__)
+
 
 def check_ollama():
     """Check if Ollama is running"""
     try:
         import httpx
-        response = httpx.get("http://localhost:11434/api/tags", timeout=5.0)
-        return response.status_code == 200
-    except:
+        with httpx.Client(timeout=5.0) as client:
+            response = client.get("http://localhost:11434/api/tags")
+            return response.status_code == 200
+    except Exception:
+        logger.exception("Failed to check Ollama status")
         return False
 
 
@@ -34,33 +39,34 @@ def check_models():
     """Check which required models are installed"""
     try:
         import httpx
-        response = httpx.get("http://localhost:11434/api/tags", timeout=5.0)
-        if response.status_code == 200:
-            models = response.json().get("models", [])
-            return [m["name"] for m in models]
-    except:
-        pass
+        with httpx.Client(timeout=5.0) as client:
+            response = client.get("http://localhost:11434/api/tags")
+            if response.status_code == 200:
+                models = response.json().get("models", [])
+                return [m.get("name", "") for m in models if m.get("name")]
+    except Exception:
+        logger.exception("Failed to fetch installed Ollama models")
     return []
 
 
 def print_banner():
     """Print startup banner"""
     banner = """
-    ╔═══════════════════════════════════════════════════════════════╗
-    ║                                                               ║
-    ║   AI Assistant - Intelligent Local LLM                        ║
-    ║                                                               ║
-    ║   Features:                                                   ║
-    ║   • Automatic model selection (quick/standard/power)          ║
-    ║   • Automatic web search for current information              ║
-    ║   • Document reading (Office, PDF, CSV, databases)            ║
-    ║   • QVD file support (QlikView data)                          ║
-    ║   • Image understanding and analysis                          ║
-    ║                                                               ║
-    ║   All intelligence is backend-controlled.                     ║
-    ║   Users see a simple, clean chat interface.                   ║
-    ║                                                               ║
-    ╚═══════════════════════════════════════════════════════════════╝
+    ===============================================================
+
+      AI Assistant - Intelligent Local LLM
+
+      Features:
+        - Automatic model selection (quick/standard/power)
+        - Automatic web search for current information
+        - Document reading (Office, PDF, CSV, databases)
+        - QVD file support (QlikView data)
+        - Image understanding and analysis
+
+      All intelligence is backend-controlled.
+      Users see a simple, clean chat interface.
+
+    ===============================================================
     """
     print(banner)
 
@@ -69,21 +75,21 @@ def print_model_status(installed_models):
     """Print model installation status"""
     print("\nModel Configuration:")
     print("-" * 50)
-    
+
     for tier, config in settings.models.items():
         name = config.name
         base_name = name.split(":")[0]
-        
+
         # Check if installed
         is_installed = (
-            name in installed_models or 
-            f"{base_name}:latest" in installed_models or
-            any(base_name in m for m in installed_models)
+            name in installed_models
+            or f"{base_name}:latest" in installed_models
+            or any(base_name in m for m in installed_models)
         )
-        
+
         status = "Installed" if is_installed else "Not installed"
-        print(f"   {tier.value.upper():10} → {name:20} {status}")
-    
+        print(f"   {tier.value.upper():10} -> {name:20} {status}")
+
     print("-" * 50)
 
 

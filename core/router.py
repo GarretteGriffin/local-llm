@@ -3,6 +3,7 @@ Query Router - Intelligently classifies queries and selects appropriate model + 
 All routing logic is backend-controlled, invisible to users.
 """
 import re
+from datetime import date
 from typing import List, Tuple, Optional, Set
 from dataclasses import dataclass
 
@@ -36,8 +37,9 @@ class QueryRouter:
         r"\b(what('s| is) happening|what('s| is) going on)\b",
         r"\b(who won|who is winning|who's leading)\b",
         r"\b(update|updates|status)\b",
-        r"\b(2024|2025|2026)\b",  # Recent years
     ]
+
+    YEAR_RE = re.compile(r"\b(19|20)\d{2}\b")
     
     # Patterns indicating complex analysis needed
     POWER_PATTERNS = [
@@ -152,7 +154,23 @@ class QueryRouter:
                 for keyword in rule.keywords:
                     if keyword.lower() in query:
                         return True
+
+        # Dynamic recent-year check (avoids hard-coded year lists)
+        if self._mentions_recent_year(query):
+            return True
         
+        return False
+
+    def _mentions_recent_year(self, query: str) -> bool:
+        """Return True if the query mentions a year near the current year."""
+        current_year = date.today().year
+        for m in self.YEAR_RE.finditer(query):
+            try:
+                year = int(m.group(0))
+            except ValueError:
+                continue
+            if abs(year - current_year) <= 2:
+                return True
         return False
     
     def _mentions_images(self, query: str) -> bool:

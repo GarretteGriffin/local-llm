@@ -123,47 +123,45 @@ class DatabaseTool:
     def _read_sqlite(self, file_path: str, filename: str) -> DatabaseContent:
         """Read SQLite database"""
         import sqlite3
-        
-        conn = sqlite3.connect(file_path)
-        cursor = conn.cursor()
-        
-        # Get all tables
-        cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
-        tables = [row[0] for row in cursor.fetchall()]
-        
+
         content_parts = []
         total_rows = 0
-        
-        for table in tables:
-            # Get schema
-            cursor.execute(f"PRAGMA table_info({table})")
-            columns = cursor.fetchall()
-            col_names = [col[1] for col in columns]
-            col_types = [col[2] for col in columns]
-            
-            content_parts.append(f"\n[Table: {table}]")
-            content_parts.append(f"Columns: {', '.join(f'{n} ({t})' for n, t in zip(col_names, col_types))}")
-            
-            # Get row count
-            cursor.execute(f"SELECT COUNT(*) FROM {table}")
-            count = cursor.fetchone()[0]
-            total_rows += count
-            content_parts.append(f"Rows: {count}")
-            
-            # Get sample data
-            cursor.execute(f"SELECT * FROM {table} LIMIT {self.max_rows}")
-            rows = cursor.fetchall()
-            
-            if rows:
-                content_parts.append("Sample data:")
-                content_parts.append(" | ".join(col_names))
-                content_parts.append("-" * 40)
-                for row in rows[:10]:  # Show first 10
-                    content_parts.append(" | ".join(str(v) if v is not None else "NULL" for v in row))
-                if len(rows) > 10:
-                    content_parts.append(f"... ({len(rows)} rows shown)")
-        
-        conn.close()
+
+        with sqlite3.connect(file_path) as conn:
+            cursor = conn.cursor()
+
+            # Get all tables
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
+            tables = [row[0] for row in cursor.fetchall()]
+
+            for table in tables:
+                # Get schema
+                cursor.execute(f"PRAGMA table_info({table})")
+                columns = cursor.fetchall()
+                col_names = [col[1] for col in columns]
+                col_types = [col[2] for col in columns]
+
+                content_parts.append(f"\n[Table: {table}]")
+                content_parts.append(f"Columns: {', '.join(f'{n} ({t})' for n, t in zip(col_names, col_types))}")
+
+                # Get row count
+                cursor.execute(f"SELECT COUNT(*) FROM {table}")
+                count = cursor.fetchone()[0]
+                total_rows += count
+                content_parts.append(f"Rows: {count}")
+
+                # Get sample data
+                cursor.execute(f"SELECT * FROM {table} LIMIT {self.max_rows}")
+                rows = cursor.fetchall()
+
+                if rows:
+                    content_parts.append("Sample data:")
+                    content_parts.append(" | ".join(col_names))
+                    content_parts.append("-" * 40)
+                    for row in rows[:10]:  # Show first 10
+                        content_parts.append(" | ".join(str(v) if v is not None else "NULL" for v in row))
+                    if len(rows) > 10:
+                        content_parts.append(f"... ({len(rows)} rows shown)")
         
         return DatabaseContent(
             filename=filename,
@@ -193,6 +191,7 @@ class DatabaseTool:
             f'DBQ={file_path};'
         )
         
+        conn = None
         try:
             conn = pyodbc.connect(conn_str)
             cursor = conn.cursor()
@@ -226,8 +225,6 @@ class DatabaseTool:
                     for row in rows[:10]:
                         content_parts.append(" | ".join(str(v) if v is not None else "NULL" for v in row))
             
-            conn.close()
-            
             return DatabaseContent(
                 filename=filename,
                 db_type='access',
@@ -235,7 +232,7 @@ class DatabaseTool:
                 content="\n".join(content_parts),
                 row_count=total_rows
             )
-            
+
         except pyodbc.Error as e:
             return DatabaseContent(
                 filename=filename,
@@ -244,6 +241,13 @@ class DatabaseTool:
                 content="",
                 error=f"Access database error: {str(e)}"
             )
+
+        finally:
+            try:
+                if conn is not None:
+                    conn.close()
+            except Exception:
+                pass
     
     def _read_qvd(self, file_path: str, filename: str) -> DatabaseContent:
         """Read QlikView QVD file"""

@@ -92,6 +92,11 @@ class Settings(BaseSettings):
     # Server settings
     ui_port: int = 7860
     api_port: int = 8000
+
+    # Session management (in-memory) - prevents unbounded growth
+    session_ttl_seconds: int = 60 * 60 * 4  # 4 hours
+    session_cleanup_interval_seconds: int = 60  # 1 minute
+    session_max_sessions: int = 500
     
     def model_post_init(self, __context: Any) -> None:
         """Initialize default models and routing rules if not set"""

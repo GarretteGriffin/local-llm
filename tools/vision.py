@@ -8,6 +8,9 @@ from typing import Optional, Union, List
 from dataclasses import dataclass
 import tempfile
 import os
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -66,7 +69,7 @@ class VisionTool:
             return None
             
         except Exception as e:
-            print(f"Error preparing image: {e}")
+            logger.exception("Error preparing image")
             return None
     
     def analyze_sync(

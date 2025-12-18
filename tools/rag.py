@@ -5,12 +5,17 @@ All local - no API keys needed.
 """
 import hashlib
 import httpx
+import logging
+import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Dict, Any, Optional, Tuple
 from dataclasses import dataclass
 from pathlib import Path
 import chromadb
 from chromadb.config import Settings as ChromaSettings
 import re
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -65,7 +70,7 @@ class RAGTool:
         
         self._session_docs: Dict[str, str] = {}  # Track docs added this session
     
-    def _get_embedding(self, text: str) -> List[float]:
+    def _get_embedding(self, text: str) -> Optional[List[float]]:
         """Get embedding from Ollama"""
         try:
             with httpx.Client(timeout=30.0) as client:
@@ -78,21 +83,30 @@ class RAGTool:
                 )
                 if response.status_code == 200:
                     return response.json()["embedding"]
-        except Exception as e:
-            print(f"[RAG] Embedding error: {e}")
-        return []
+        except Exception:
+            logger.exception("RAG embedding error")
+        return None
     
-    def _get_embeddings_batch(self, texts: List[str]) -> List[List[float]]:
-        """Get embeddings for multiple texts"""
-        embeddings = []
-        for text in texts:
-            emb = self._get_embedding(text)
-            if emb:
-                embeddings.append(emb)
-            else:
-                # Fallback: zero vector (will have low similarity)
-                embeddings.append([0.0] * 768)
-        return embeddings
+    def _get_embeddings_batch(self, texts: List[str]) -> List[Optional[List[float]]]:
+        """Get embeddings for multiple texts (aligned to input order)."""
+        if not texts:
+            return []
+
+        # Ollama's embeddings endpoint is per-prompt; parallelize calls for throughput.
+        max_workers = min(8, (os.cpu_count() or 4))
+        results: List[Optional[List[float]]] = [None] * len(texts)
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {executor.submit(self._get_embedding, t): i for i, t in enumerate(texts)}
+            for fut in as_completed(futures):
+                idx = futures[fut]
+                try:
+                    results[idx] = fut.result()
+                except Exception:
+                    logger.exception("RAG embedding worker failed")
+                    results[idx] = None
+
+        return results
     
     def _chunk_text(self, text: str, filename: str) -> List[Chunk]:
         """Split text into overlapping chunks"""
@@ -202,16 +216,16 @@ class RAGTool:
         # Check if already indexed
         doc_hash = hashlib.md5(content.encode()).hexdigest()
         if filename in self._session_docs and self._session_docs[filename] == doc_hash:
-            print(f"[RAG] {filename} already indexed, skipping")
+            logger.info("RAG: %s already indexed; skipping", filename)
             return 0
         
         # Remove old chunks for this file if re-indexing
         try:
             existing = self.collection.get(where={"filename": filename})
-            if existing and existing['ids']:
+            if existing and existing.get('ids'):
                 self.collection.delete(ids=existing['ids'])
-        except:
-            pass
+        except Exception:
+            logger.exception("RAG: failed to delete existing chunks for %s", filename)
         
         # Chunk the document
         if is_structured:
@@ -222,24 +236,46 @@ class RAGTool:
         if not chunks:
             return 0
         
-        print(f"[RAG] Chunking {filename} into {len(chunks)} chunks...")
+        logger.info("RAG: chunking %s into %d chunks", filename, len(chunks))
         
-        # Get embeddings
+        # Get embeddings (parallel). Skip chunks that fail embedding rather than inserting
+        # meaningless zero vectors.
         texts = [c.text for c in chunks]
-        embeddings = self._get_embeddings_batch(texts)
-        
-        # Add to ChromaDB
+        max_workers = min(8, (os.cpu_count() or 4))
+        embedded: List[Tuple[Chunk, List[float]]] = []
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {executor.submit(self._get_embedding, t): i for i, t in enumerate(texts)}
+            for fut in as_completed(futures):
+                idx = futures[fut]
+                emb = None
+                try:
+                    emb = fut.result()
+                except Exception:
+                    logger.exception("RAG: embedding worker failed")
+                if emb:
+                    embedded.append((chunks[idx], emb))
+                else:
+                    logger.warning("RAG: skipping chunk %s (embedding failed)", chunks[idx].chunk_id)
+
+        if not embedded:
+            logger.warning("RAG: no chunks embedded for %s; skipping index", filename)
+            return 0
+
+        # Keep stable order by chunk_num for readability/debuggability
+        embedded.sort(key=lambda pair: pair[0].metadata.get("chunk_num", 0))
+
         self.collection.add(
-            ids=[c.chunk_id for c in chunks],
-            embeddings=embeddings,
-            documents=texts,
-            metadatas=[c.metadata for c in chunks]
+            ids=[c.chunk_id for c, _ in embedded],
+            embeddings=[e for _, e in embedded],
+            documents=[c.text for c, _ in embedded],
+            metadatas=[c.metadata for c, _ in embedded],
         )
         
         self._session_docs[filename] = doc_hash
-        print(f"[RAG] Indexed {len(chunks)} chunks from {filename}")
+        logger.info("RAG: indexed %d chunks from %s", len(embedded), filename)
         
-        return len(chunks)
+        return len(embedded)
     
     def retrieve(self, query: str, n_results: int = None) -> RetrievalResult:
         """
@@ -257,7 +293,7 @@ class RAGTool:
         # Get query embedding
         query_embedding = self._get_embedding(query)
         if not query_embedding:
-            print("[RAG] Failed to get query embedding")
+            logger.warning("RAG: failed to get query embedding")
             return RetrievalResult(chunks=[], total_chars=0, source_files=[])
         
         # Query ChromaDB

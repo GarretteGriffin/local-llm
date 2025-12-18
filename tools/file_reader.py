@@ -81,6 +81,14 @@ class FileReaderTool:
         
         # Handle file bytes (uploaded files)
         if file_bytes:
+            if len(file_bytes) > self.max_size:
+                return FileContent(
+                    filename=filename,
+                    file_type=file_type,
+                    content="",
+                    metadata={},
+                    error=f"File too large (max {self.settings.max_file_size_mb}MB)"
+                )
             # Write to temp file
             with tempfile.NamedTemporaryFile(delete=False, suffix=extension) as tmp:
                 tmp.write(file_bytes)
