@@ -10,6 +10,125 @@ const attachmentsEl = document.getElementById('attachments');
 const toolStatusEl = document.getElementById('tool-status');
 const toolTextEl = document.querySelector('.tool-text');
 
+function normalizeMarkdownLinks(text) {
+  // Fix common streaming/newline breaks that split markdown link syntax.
+  return String(text || '').replace(/\]\s*\n\s*\(/g, '](');
+}
+
+function setAnchorBehavior(root) {
+  root.querySelectorAll('a[href]').forEach((a) => {
+    a.target = '_blank';
+    a.rel = 'noopener noreferrer';
+  });
+}
+
+function linkifyElement(root) {
+  // Convert bare URLs in rendered HTML into clickable links.
+  // Skips existing links and code blocks.
+  const urlRe = /(https?:\/\/[^\s<]+|www\.[^\s<]+)/gi;
+  const urlTestRe = /(https?:\/\/[^\s<]+|www\.[^\s<]+)/i;
+
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+    acceptNode(node) {
+      const parent = node.parentElement;
+      if (!parent) return NodeFilter.FILTER_REJECT;
+      if (parent.closest('a, code, pre, script, style')) return NodeFilter.FILTER_REJECT;
+      if (!node.nodeValue || !urlTestRe.test(node.nodeValue)) return NodeFilter.FILTER_REJECT;
+      return NodeFilter.FILTER_ACCEPT;
+    },
+  });
+
+  const nodes = [];
+  while (walker.nextNode()) nodes.push(walker.currentNode);
+
+  for (const textNode of nodes) {
+    const text = textNode.nodeValue || '';
+    const frag = document.createDocumentFragment();
+    let lastIndex = 0;
+
+    // Reset lastIndex because urlRe is global.
+    urlRe.lastIndex = 0;
+    let match;
+    while ((match = urlRe.exec(text)) !== null) {
+      const start = match.index;
+      const raw = match[0];
+
+      if (start > lastIndex) {
+        frag.appendChild(document.createTextNode(text.slice(lastIndex, start)));
+      }
+
+      // Trim trailing punctuation that often follows URLs in prose.
+      let display = raw;
+      let url = raw;
+      let trailing = '';
+      while (/[\]\)\}>,.;:!?]$/.test(url)) {
+        trailing = url.slice(-1) + trailing;
+        url = url.slice(0, -1);
+        display = display.slice(0, -1);
+      }
+
+      const a = document.createElement('a');
+      a.textContent = display;
+      a.href = url.startsWith('www.') ? `https://${url}` : url;
+      a.target = '_blank';
+      a.rel = 'noopener noreferrer';
+      frag.appendChild(a);
+
+      if (trailing) frag.appendChild(document.createTextNode(trailing));
+      lastIndex = start + raw.length;
+    }
+
+    if (lastIndex < text.length) {
+      frag.appendChild(document.createTextNode(text.slice(lastIndex)));
+    }
+
+    textNode.parentNode.replaceChild(frag, textNode);
+  }
+}
+
+function extractSources(root) {
+  const seen = new Set();
+  const sources = [];
+
+  root.querySelectorAll('a[href]').forEach((a) => {
+    const href = a.getAttribute('href') || '';
+    if (!/^https?:\/\//i.test(href)) return;
+    if (seen.has(href)) return;
+    seen.add(href);
+
+    let label = (a.textContent || '').trim();
+    if (!label || label === href) {
+      try {
+        label = new URL(href).hostname;
+      } catch {
+        label = href;
+      }
+    }
+    sources.push({ href, label });
+  });
+
+  return sources;
+}
+
+function renderSources(detailsEl, sources) {
+  if (!detailsEl) return;
+  if (!sources.length) {
+    detailsEl.classList.add('hidden');
+    detailsEl.open = false;
+    detailsEl.innerHTML = '';
+    return;
+  }
+
+  detailsEl.classList.remove('hidden');
+  const items = sources
+    .map(
+      (s) =>
+        `<li><a href="${s.href}" target="_blank" rel="noopener noreferrer">${s.label}</a></li>`,
+    )
+    .join('');
+  detailsEl.innerHTML = `<summary>Sources</summary><ol>${items}</ol>`;
+}
+
 messageEl.addEventListener('input', function () {
   this.style.height = 'auto';
   this.style.height = `${this.scrollHeight}px`;
@@ -30,7 +149,13 @@ function addMessage(role, text = '') {
   const div = document.createElement('div');
   div.className = `msg ${role}`;
   if (role === 'bot') {
-    div.innerHTML = text ? marked.parse(text) : '';
+    div.innerHTML = `<div class="content"></div><details class="sources hidden"></details>`;
+    const contentEl = div.querySelector('.content');
+    const normalized = normalizeMarkdownLinks(text);
+    contentEl.innerHTML = normalized ? marked.parse(normalized) : '';
+    linkifyElement(contentEl);
+    setAnchorBehavior(contentEl);
+    renderSources(div.querySelector('.sources'), extractSources(contentEl));
   } else {
     div.textContent = text;
   }
@@ -74,6 +199,8 @@ async function send() {
 
   addMessage('user', text || '(files attached)');
   const botDiv = addMessage('bot');
+  const botContentEl = botDiv.querySelector('.content');
+  const botSourcesEl = botDiv.querySelector('.sources');
 
   messageEl.value = '';
   messageEl.style.height = 'auto';
@@ -139,14 +266,24 @@ async function send() {
             break;
           case 'error':
             fullContent += `\n\n*Error: ${payload.message || 'Unknown error'}*`;
-            botDiv.innerHTML = marked.parse(fullContent);
+            {
+              const displayContent = normalizeMarkdownLinks(cleanText(fullContent));
+              botContentEl.innerHTML = marked.parse(displayContent);
+              linkifyElement(botContentEl);
+              setAnchorBehavior(botContentEl);
+              renderSources(botSourcesEl, extractSources(botContentEl));
+            }
             break;
           case 'content':
             if (!payload.content) break;
             fullContent += payload.content;
-            const displayContent = cleanText(fullContent);
-            botDiv.innerHTML = marked.parse(displayContent);
-            botDiv.querySelectorAll('a').forEach((a) => (a.target = '_blank'));
+            {
+              const displayContent = normalizeMarkdownLinks(cleanText(fullContent));
+              botContentEl.innerHTML = marked.parse(displayContent);
+              linkifyElement(botContentEl);
+              setAnchorBehavior(botContentEl);
+              renderSources(botSourcesEl, extractSources(botContentEl));
+            }
             break;
           default:
             break;
