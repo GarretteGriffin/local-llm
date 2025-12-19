@@ -9,8 +9,11 @@ from dataclasses import dataclass
 import tempfile
 import os
 import logging
+import time
 
 logger = logging.getLogger(__name__)
+
+from config import settings
 
 
 @dataclass
@@ -93,17 +96,44 @@ class VisionTool:
         """
         try:
             import httpx
-            
-            with httpx.Client(timeout=120.0) as client:
-                response = client.post(
-                    "http://localhost:11434/api/generate",
-                    json={
-                        "model": model,
-                        "prompt": query,
-                        "images": [image_base64],
-                        "stream": False
-                    }
-                )
+
+            base_url = settings.ollama_base_url.rstrip("/")
+            url = f"{base_url}/api/generate"
+            retries = int(getattr(settings, "ollama_retries", 2) or 0)
+            backoff = float(getattr(settings, "ollama_retry_backoff_seconds", 0.5) or 0.0)
+
+            timeout = httpx.Timeout(
+                connect=float(getattr(settings, "ollama_connect_timeout_seconds", 5.0)),
+                read=120.0,
+                write=float(getattr(settings, "ollama_write_timeout_seconds", 30.0)),
+                pool=5.0,
+            )
+
+            response = None
+            for attempt in range(retries + 1):
+                try:
+                    with httpx.Client(timeout=timeout) as client:
+                        response = client.post(
+                            url,
+                            json={
+                                "model": model,
+                                "prompt": query,
+                                "images": [image_base64],
+                                "stream": False,
+                            },
+                        )
+                    if response.status_code in (429, 500, 502, 503, 504) and attempt < retries:
+                        time.sleep(backoff * (2**attempt))
+                        continue
+                    break
+                except (httpx.ConnectError, httpx.ReadTimeout, httpx.RemoteProtocolError):
+                    if attempt < retries:
+                        time.sleep(backoff * (2**attempt))
+                        continue
+                    raise
+
+            if response is None:
+                raise RuntimeError("No response from vision request")
                 
                 if response.status_code != 200:
                     return ImageAnalysis(

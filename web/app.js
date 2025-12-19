@@ -1,19 +1,25 @@
 ﻿let sessionId = null;
 let activeConversationId = null;
 
+let pendingTools = 0;
+let sawAnyContent = false;
+let agentMode = false;
+let selectedAgent = 'workforce';
+
 const chatEl = document.getElementById('chat');
 const messageEl = document.getElementById('message');
 const sendBtn = document.getElementById('sendBtn');
 const clearBtn = document.getElementById('clearBtn');
-const attachBtn = document.getElementById('attachBtn');
+const actionBtn = document.getElementById('actionBtn');
+const actionMenu = document.getElementById('actionMenu');
+const agentModeBtn = document.getElementById('agentModeBtn');
+const agentPickerEl = document.getElementById('agentPicker');
 const fileInput = document.getElementById('fileInput');
 const attachmentsEl = document.getElementById('attachments');
 const toolStatusEl = document.getElementById('tool-status');
 const toolTextEl = document.querySelector('.tool-text');
 const convoListEl = document.getElementById('convoList');
 const newChatBtn = document.getElementById('newChatBtn');
-const activityListEl = document.getElementById('activityList');
-const clearActivityBtn = document.getElementById('clearActivityBtn');
 
 const STORAGE_KEY = 'local-llm-conversations-v1';
 
@@ -306,40 +312,6 @@ function renderConversationList() {
   }
 }
 
-function appendActivity(entry) {
-  if (!activityListEl) return;
-  const div = document.createElement('div');
-  div.className = 'activity-item';
-
-  const top = document.createElement('div');
-  top.className = 'activity-top';
-
-  const name = document.createElement('div');
-  name.className = 'activity-name';
-  name.textContent = entry.name || 'activity';
-
-  const status = document.createElement('div');
-  status.className = 'activity-status';
-  status.textContent = entry.status || '';
-
-  const msg = document.createElement('div');
-  msg.className = 'activity-msg';
-  msg.textContent = entry.message || '';
-
-  top.appendChild(name);
-  top.appendChild(status);
-  div.appendChild(top);
-  if (entry.message) div.appendChild(msg);
-
-  activityListEl.prepend(div);
-
-  // Keep the list from growing unbounded.
-  const max = 50;
-  while (activityListEl.childElementCount > max) {
-    activityListEl.removeChild(activityListEl.lastElementChild);
-  }
-}
-
 function renderAttachments() {
   const files = Array.from(fileInput.files || []);
   attachmentsEl.textContent = files.length
@@ -347,7 +319,142 @@ function renderAttachments() {
     : '';
 }
 
-attachBtn.addEventListener('click', () => fileInput.click());
+function titleCase(text) {
+  const t = String(text || '').trim();
+  if (!t) return '';
+  return t.charAt(0).toUpperCase() + t.slice(1);
+}
+
+function updateAgentUI() {
+  if (agentModeBtn) {
+    agentModeBtn.textContent = agentMode ? `Use agents: On (${titleCase(selectedAgent)})` : 'Use agents: Off';
+  }
+  if (agentPickerEl) {
+    if (agentMode) agentPickerEl.classList.remove('hidden');
+    else agentPickerEl.classList.add('hidden');
+    agentPickerEl.querySelectorAll('button[data-agent]').forEach((b) => {
+      const name = (b.getAttribute('data-agent') || '').trim().toLowerCase();
+      b.classList.toggle('active', name === selectedAgent);
+    });
+  }
+}
+
+function closeActionMenu() {
+  if (!actionMenu) return;
+  actionMenu.classList.add('hidden');
+  if (actionBtn) actionBtn.setAttribute('aria-expanded', 'false');
+}
+
+function toggleActionMenu() {
+  if (!actionMenu) return;
+  const isHidden = actionMenu.classList.contains('hidden');
+  if (isHidden) {
+    actionMenu.classList.remove('hidden');
+    if (actionBtn) actionBtn.setAttribute('aria-expanded', 'true');
+  } else {
+    closeActionMenu();
+  }
+}
+
+async function createOfficeFile(kind) {
+  try {
+    const resp = await fetch('/files/create', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ kind }),
+    });
+
+    if (!resp.ok) {
+      throw new Error(`Create file failed: ${resp.status}`);
+    }
+
+    const blob = await resp.blob();
+    const cd = resp.headers.get('content-disposition') || '';
+    const match = /filename="?([^";]+)"?/i.exec(cd);
+    const filename = match ? match[1] : `New File.${kind}`;
+
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  } catch (err) {
+    console.warn('Create file failed:', err);
+  }
+}
+
+if (actionBtn) {
+  actionBtn.addEventListener('click', (e) => {
+    e.preventDefault();
+    toggleActionMenu();
+  });
+}
+
+if (actionMenu) {
+  actionMenu.addEventListener('click', (e) => {
+    const btn = e.target && e.target.closest ? e.target.closest('button[data-action]') : null;
+    if (!btn) return;
+    const action = btn.getAttribute('data-action') || '';
+
+    if (action === 'attach') {
+      fileInput.click();
+      closeActionMenu();
+      return;
+    }
+
+    if (action === 'agents') {
+      agentMode = !agentMode;
+      updateAgentUI();
+      closeActionMenu();
+      messageEl.focus();
+      return;
+    }
+
+    if (action === 'set-agent') {
+      const agent = (btn.getAttribute('data-agent') || '').trim().toLowerCase();
+      if (agent) {
+        selectedAgent = agent;
+        agentMode = true;
+        updateAgentUI();
+      }
+      closeActionMenu();
+      messageEl.focus();
+      return;
+    }
+
+    if (action === 'create-word') {
+      closeActionMenu();
+      createOfficeFile('word');
+      return;
+    }
+    if (action === 'create-excel') {
+      closeActionMenu();
+      createOfficeFile('excel');
+      return;
+    }
+    if (action === 'create-powerpoint') {
+      closeActionMenu();
+      createOfficeFile('powerpoint');
+      return;
+    }
+  });
+}
+
+document.addEventListener('click', (e) => {
+  if (!actionMenu || actionMenu.classList.contains('hidden')) return;
+  const target = e.target;
+  if (target === actionBtn || (actionBtn && actionBtn.contains(target))) return;
+  if (actionMenu.contains(target)) return;
+  closeActionMenu();
+});
+
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') closeActionMenu();
+});
+
 fileInput.addEventListener('change', renderAttachments);
 
 clearBtn.addEventListener('click', () => {
@@ -376,12 +483,6 @@ if (newChatBtn) {
   });
 }
 
-if (clearActivityBtn) {
-  clearActivityBtn.addEventListener('click', () => {
-    if (activityListEl) activityListEl.innerHTML = '';
-  });
-}
-
 
 function cleanText(text) {
   return text
@@ -398,6 +499,10 @@ async function send() {
   const text = (messageEl.value || '').trim();
   const files = Array.from(fileInput.files || []);
   if (!text && files.length === 0) return;
+
+  pendingTools = 0;
+  sawAnyContent = false;
+  showTool('thinking', 'Thinking...');
 
   const convo = ensureActiveConversation(summarizeTitle(text || '(files attached)'));
   if (!convo.title || convo.title === 'New chat') {
@@ -439,9 +544,28 @@ async function send() {
   renderAttachments();
 
   try {
-    const resp = await fetch('/chat/stream', { method: 'POST', body: form });
+    if (agentMode) {
+      form.append('agent', selectedAgent || 'workforce');
+    }
+    const endpoint = agentMode ? '/agents/stream' : '/chat/stream';
+    const resp = await fetch(endpoint, { method: 'POST', body: form });
     if (!resp.ok || !resp.body) {
-      throw new Error(`Server error: ${resp.status}`);
+      let detail = '';
+      try {
+        const ct = (resp.headers.get('content-type') || '').toLowerCase();
+        if (ct.includes('application/json')) {
+          const data = await resp.json();
+          detail = data?.detail || data?.message || '';
+          if (!detail) detail = JSON.stringify(data);
+        } else {
+          detail = (await resp.text()) || '';
+        }
+      } catch (e) {
+        // ignore parsing errors
+      }
+
+      const msg = detail ? `${resp.status}: ${detail}` : `Server error: ${resp.status}`;
+      throw new Error(msg);
     }
 
     const reader = resp.body.getReader();
@@ -481,7 +605,7 @@ async function send() {
             sessionId = payload.session_id;
             {
               const current = getConversation(activeConversationId);
-              if (current && !current.sessionId) {
+                if (current && current.sessionId !== sessionId) {
                 current.sessionId = sessionId;
                 current.updatedAt = nowIso();
                 upsertConversation(current);
@@ -490,34 +614,49 @@ async function send() {
             }
             break;
           case 'tool':
-            if (payload.status === 'running') {
-              showTool(payload.tool, payload.message);
-              appendActivity({
-                name: payload.tool || 'tool',
-                status: 'running',
-                message: payload.message || '',
-              });
-            } else {
-              hideTool();
-              appendActivity({ name: payload.tool || 'tool', status: 'complete', message: '' });
+            {
+              const toolName = payload.tool || 'tool';
+              const status = payload.status || '';
+
+              if (status === 'running') {
+                pendingTools += 1;
+                showTool(toolName, payload.message);
+                break;
+              }
+
+              // Most tools are sequential and emit a matching terminal event.
+              pendingTools = Math.max(0, pendingTools - 1);
+
+              if (status === 'error') {
+                // Keep details server-side; do not surface tool errors in the UI.
+                console.warn('Tool error:', toolName);
+              } else if (status === 'skipped') {
+                // no-op
+              } else {
+                // no-op
+              }
+
+              if (pendingTools === 0) {
+                if (sawAnyContent) hideTool();
+                else showTool('thinking', 'Thinking...');
+              }
             }
             break;
           case 'routing':
             break;
           case 'error':
-            fullContent += `\n\n*Error: ${payload.message || 'Unknown error'}*`;
-            {
+            // Do not dump raw internal errors into the chat transcript (or any UI panel).
+            console.warn('Internal error event:', payload.where || 'error');
+
+            // If nothing was produced at all, show a minimal, generic fallback.
+            if (!sawAnyContent && !fullContent.trim()) {
+              fullContent = "I couldn't complete that request. Please try again.";
               const displayContent = normalizeMarkdownLinks(cleanText(fullContent));
               botContentEl.innerHTML = marked.parse(displayContent);
               linkifyElement(botContentEl);
               setAnchorBehavior(botContentEl);
-              renderSources(
-                botSourcesEl,
-                hasStructuredSources ? structuredSources : extractSources(botContentEl),
-              );
-            }
+              renderSources(botSourcesEl, hasStructuredSources ? structuredSources : extractSources(botContentEl));
 
-            {
               const current = getConversation(activeConversationId);
               if (current && botMessageIndex != null && current.messages[botMessageIndex]) {
                 current.messages[botMessageIndex].text = fullContent;
@@ -525,6 +664,8 @@ async function send() {
                 upsertConversation(current);
               }
             }
+
+            if (pendingTools === 0) hideTool();
             break;
           case 'sources': {
             const incoming = Array.isArray(payload.sources) ? payload.sources : [];
@@ -540,15 +681,11 @@ async function send() {
             }
             hasStructuredSources = structuredSources.length > 0;
             renderSources(botSourcesEl, structuredSources);
-            appendActivity({
-              name: 'sources',
-              status: 'updated',
-              message: `${structuredSources.length} source(s)`,
-            });
             break;
           }
           case 'content':
             if (!payload.content) break;
+            sawAnyContent = true;
             fullContent += payload.content;
             {
               const displayContent = normalizeMarkdownLinks(cleanText(fullContent));
@@ -560,6 +697,8 @@ async function send() {
                 hasStructuredSources ? structuredSources : extractSources(botContentEl),
               );
             }
+
+            if (pendingTools === 0) hideTool();
 
             {
               const current = getConversation(activeConversationId);
@@ -578,7 +717,17 @@ async function send() {
       }
     }
   } catch (err) {
-    botDiv.textContent = `Error: ${err.message}`;
+    console.warn('Request failed:', err);
+    // Keep chat credibility: show a generic response only if we got nothing.
+    if (!sawAnyContent) {
+      const fallback = "I couldn't complete that request. Please try again.";
+      const botContentEl = botDiv.querySelector('.content');
+      if (botContentEl) {
+        botContentEl.innerHTML = marked.parse(fallback);
+      } else {
+        botDiv.textContent = fallback;
+      }
+    }
   } finally {
     hideTool();
   }
@@ -600,3 +749,5 @@ renderConversationList();
     setActiveConversation(conversations[0].id);
   }
 }
+
+updateAgentUI();

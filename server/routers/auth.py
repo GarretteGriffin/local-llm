@@ -92,7 +92,8 @@ async def _get_oauth():
         client_secret=settings.azure_client_secret,
         server_metadata_url=_server_metadata_url(),
         client_kwargs={
-            "scope": "openid profile email",
+            "scope": " ".join([s for s in (settings.azure_scopes or []) if str(s).strip()])
+            or "openid profile email",
         },
     )
     return oauth

@@ -64,8 +64,10 @@ def check_ollama():
     """Check if Ollama is running"""
     try:
         import httpx
-        with httpx.Client(timeout=5.0) as client:
-            response = client.get("http://localhost:11434/api/tags")
+        base_url = settings.ollama_base_url.rstrip("/")
+        timeout = httpx.Timeout(connect=float(getattr(settings, "ollama_connect_timeout_seconds", 5.0)), read=5.0, write=5.0, pool=5.0)
+        with httpx.Client(timeout=timeout) as client:
+            response = client.get(f"{base_url}/api/tags")
             return response.status_code == 200
     except Exception:
         logger.exception("Failed to check Ollama status")
@@ -76,8 +78,10 @@ def check_models():
     """Check which required models are installed"""
     try:
         import httpx
-        with httpx.Client(timeout=5.0) as client:
-            response = client.get("http://localhost:11434/api/tags")
+        base_url = settings.ollama_base_url.rstrip("/")
+        timeout = httpx.Timeout(connect=float(getattr(settings, "ollama_connect_timeout_seconds", 5.0)), read=10.0, write=10.0, pool=5.0)
+        with httpx.Client(timeout=timeout) as client:
+            response = client.get(f"{base_url}/api/tags")
             if response.status_code == 200:
                 models = response.json().get("models", [])
                 return [m.get("name", "") for m in models if m.get("name")]

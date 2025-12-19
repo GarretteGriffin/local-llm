@@ -13,6 +13,8 @@ from starlette.responses import RedirectResponse
 from config import settings
 from server.routers import chat
 from server.routers import auth
+from server.routers import agents
+from server.routers import files
 from server.auth import get_current_user_optional
 
 app = FastAPI(
@@ -24,13 +26,21 @@ app = FastAPI(
 )
 
 # CORS
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # Configure appropriately for production
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+cors_allow_origins = settings.cors_allow_origins
+if not cors_allow_origins and settings.environment == "development":
+    # Dev-friendly default; in production, prefer explicit allow-list.
+    cors_allow_origins = ["*"]
+
+if cors_allow_origins:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=cors_allow_origins,
+        # Credentials + wildcard origins is invalid CORS. If you need cookies cross-origin,
+        # set an explicit allow-list in CORS_ALLOW_ORIGINS.
+        allow_credentials=cors_allow_origins != ["*"],
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
 
 # Session middleware is used by Authlib to store OAuth state (not access tokens).
 if settings.auth_enabled:
@@ -53,6 +63,8 @@ app.mount("/static", StaticFiles(directory=str(_web_dir), html=False), name="sta
 # Include routers
 app.include_router(chat.router)
 app.include_router(auth.router)
+app.include_router(agents.router)
+app.include_router(files.router)
 
 @app.get("/", response_class=HTMLResponse)
 def index(request: Request) -> HTMLResponse:

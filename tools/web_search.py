@@ -5,9 +5,12 @@ Uses DuckDuckGo (free) or Tavily API for search.
 from typing import List
 from dataclasses import dataclass
 import httpx
+import logging
 from urllib.parse import quote_plus
 
 from config import settings
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -68,7 +71,7 @@ class WebSearchTool:
         except ImportError:
             return self._search_duckduckgo_html(query, max_results)
         except Exception as e:
-            print(f"DuckDuckGo search error: {e}")
+            logger.warning("DuckDuckGo search error; falling back to HTML", exc_info=True)
             return self._search_duckduckgo_html(query, max_results)
     
     def _search_duckduckgo_html(self, query: str, max_results: int) -> List[SearchResult]:
@@ -102,7 +105,7 @@ class WebSearchTool:
                 return results
             
         except Exception as e:
-            print(f"DuckDuckGo HTML search error: {e}")
+            logger.warning("DuckDuckGo HTML search error", exc_info=True)
             return []
     
     def _search_tavily(self, query: str, max_results: int) -> List[SearchResult]:
@@ -145,7 +148,7 @@ class WebSearchTool:
                 return results
             
         except Exception as e:
-            print(f"Tavily search error: {e}")
+            logger.warning("Tavily search error; falling back to DuckDuckGo", exc_info=True)
             return self._search_duckduckgo(query, max_results)
     
     def format_results(self, results: List[SearchResult]) -> str:

@@ -51,6 +51,9 @@ class QueryRouter:
         r"\b(summarize|summary|breakdown|explain)\b.*\b(document|file|report|data)\b",
         r"\b(implications|consequences|impact|effects)\b",
         r"\b(forecast|predict|projection|trend)\b",
+        # Multi-step / engineering / execution requests often need stronger reasoning.
+        r"\b(plan|design|implement|debug|root cause|fix|refactor|investigate)\b",
+        r"\b(step[- ]by[- ]step|walk me through|trade-?offs)\b",
     ]
     
     # Quick response patterns
@@ -99,6 +102,15 @@ class QueryRouter:
         tier = ModelTier.STANDARD
         confidence = 0.7
         reasoning_parts = []
+
+        # Apply keyword-based routing rules (tier + tools) early.
+        # NOTE: The tier may still be upgraded later by complexity/file heuristics.
+        best_rule = self._best_routing_rule(query_lower)
+        if best_rule:
+            tier = best_rule.tier
+            tools.update(best_rule.tools)
+            confidence = max(confidence, 0.75)
+            reasoning_parts.append(f"Matched rule keywords → {best_rule.tier.value.title()} model")
         
         # Check for images first - they require vision model
         if has_images or self._mentions_images(query_lower):
@@ -117,6 +129,12 @@ class QueryRouter:
             if any(ext.lower() in db_extensions for ext in file_types):
                 tools.add(ToolType.DATABASE)
                 reasoning_parts.append("Database access required")
+
+            # Structured data (spreadsheets/CSVs) benefit from local computation.
+            structured_exts = {'.xlsx', '.xls', '.csv'}
+            if any(ext.lower() in structured_exts for ext in file_types):
+                tools.add(ToolType.SPREADSHEET)
+                reasoning_parts.append("Spreadsheet compute available")
         
         # Check if web search is needed (automatic, no button)
         needs_web = self._needs_web_search(query_lower)
@@ -129,6 +147,11 @@ class QueryRouter:
             tier, tier_confidence, tier_reason = self._determine_tier(query_lower, has_files)
             confidence = max(confidence, tier_confidence)
             reasoning_parts.append(tier_reason)
+
+        # Calculator heuristic: even without a matched rule, math-y queries should run the calculator.
+        if self._looks_like_math(query_lower):
+            tools.add(ToolType.CALCULATOR)
+            reasoning_parts.append("Math detected → Calculator")
         
         # Build final decision
         return RoutingDecision(
@@ -182,10 +205,12 @@ class QueryRouter:
     def _determine_tier(self, query: str, has_files: bool) -> Tuple[ModelTier, float, str]:
         """Determine which model tier to use"""
         
-        # Check for quick patterns first (highest priority for simple queries)
-        for pattern in self.quick_re:
-            if pattern.search(query):
-                return ModelTier.QUICK, 0.9, "Simple query → Quick model"
+        # Check for quick patterns first, but NEVER downgrade file-backed questions.
+        # With files, we want stronger reasoning and tool use (e.g., spreadsheets/docs).
+        if not has_files:
+            for pattern in self.quick_re:
+                if pattern.search(query):
+                    return ModelTier.QUICK, 0.9, "Simple query → Quick model"
         
         # Check for power patterns
         power_matches = sum(1 for p in self.power_re if p.search(query))
@@ -196,16 +221,9 @@ class QueryRouter:
             return ModelTier.STANDARD, 0.7, "Moderate complexity → Standard model"
         
         # Check routing rules from settings
-        matched_rules = []
-        for rule in self.settings.routing_rules:
-            keyword_matches = sum(1 for kw in rule.keywords if kw.lower() in query)
-            if keyword_matches > 0:
-                matched_rules.append((rule, keyword_matches))
-        
-        if matched_rules:
-            # Sort by priority and match count
-            matched_rules.sort(key=lambda x: (x[0].priority, x[1]), reverse=True)
-            best_rule = matched_rules[0][0]
+        # Check routing rules from settings
+        best_rule = self._best_routing_rule(query)
+        if best_rule:
             return best_rule.tier, 0.75, f"Matched rule keywords → {best_rule.tier.value.title()} model"
         
         # Check query length and complexity heuristics
@@ -217,6 +235,35 @@ class QueryRouter:
         
         # Default to standard
         return ModelTier.STANDARD, 0.5, "Default → Standard model"
+
+    def _best_routing_rule(self, query: str):
+        matched_rules = []
+        for rule in self.settings.routing_rules:
+            keyword_matches = sum(1 for kw in rule.keywords if kw.lower() in query)
+            if keyword_matches > 0:
+                matched_rules.append((rule, keyword_matches))
+
+        if not matched_rules:
+            return None
+
+        matched_rules.sort(key=lambda x: (x[0].priority, x[1]), reverse=True)
+        return matched_rules[0][0]
+
+    @staticmethod
+    def _looks_like_math(query: str) -> bool:
+        q = (query or "").strip()
+        if not q:
+            return False
+
+        # Bare arithmetic expression (conservative)
+        allowed = set("0123456789+-*/().%^ ,")
+        if len(q) <= 80 and any(c.isdigit() for c in q) and all((c.isdigit() or c in allowed or c.isspace()) for c in q):
+            return True
+
+        # Keyword signals
+        keywords = ["calculate", "compute", "evaluate", "solve", "percent", "percentage", "cagr", "interest", "margin"]
+        ql = q.lower()
+        return any(k in ql for k in keywords)
     
     def explain_decision(self, decision: RoutingDecision) -> str:
         """Generate human-readable explanation of routing decision (for logging)"""

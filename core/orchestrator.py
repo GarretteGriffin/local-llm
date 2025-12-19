@@ -6,13 +6,29 @@ All orchestration happens on the backend; the UI is just a client.
 from typing import List, Optional, Generator, Dict, Any, Tuple
 from dataclasses import dataclass
 from pathlib import Path
+import logging
 import httpx
 import json
+import time
 
 from config import settings, ModelTier, ToolType
 from config.admin_overrides import get_model_overrides, get_system_prompt, get_tool_override
 from core.router import QueryRouter, RoutingDecision
-from tools import WebSearchTool, FileReaderTool, VisionTool, DatabaseTool, RAGTool
+from core.agents import get_agent
+from tools import (
+    WebSearchTool,
+    FileReaderTool,
+    VisionTool,
+    DatabaseTool,
+    RAGTool,
+    SpreadsheetTool,
+    CalculatorTool,
+    MicrosoftGraphTool,
+)
+from tools.calculator import looks_like_math_query
+from tools.ms_graph import extract_microsoft_urls
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -110,6 +126,9 @@ Your goal is to have natural, fluid conversations with the user.
         self.vision = VisionTool()
         self.database = DatabaseTool()
         self.rag = RAGTool()  # RAG for intelligent document retrieval
+        self.spreadsheet = SpreadsheetTool()
+        self.calculator = CalculatorTool()
+        self.ms_graph = MicrosoftGraphTool()
         
         # Conversation history
         self.messages: List[Message] = []
@@ -119,7 +138,9 @@ Your goal is to have natural, fluid conversations with the user.
         self,
         query: str,
         files: Optional[List[Tuple[str, bytes]]] = None,
-        images: Optional[List[Tuple[str, bytes]]] = None
+        images: Optional[List[Tuple[str, bytes]]] = None,
+        user: Optional[Dict[str, Any]] = None,
+        token: Optional[Dict[str, Any]] = None,
     ) -> Generator[Dict[str, Any], None, None]:
         """
         Process a query with optional files and images.
@@ -132,51 +153,110 @@ Your goal is to have natural, fluid conversations with the user.
         """
         files = files or []
         images = images or []
+
+        # Per-request identity context (used for permission-aware tools).
+        # Not persisted beyond this request.
+        self._request_user = user or {}
+        self._request_token = token or {}
         
         # Determine file types
         file_types = [Path(f[0]).suffix.lower() for f in files]
         has_files = len(files) > 0
         has_images = len(images) > 0
         
-        # Route the query
-        decision = self.router.route(
-            query=query,
-            has_files=has_files,
-            file_types=file_types,
-            has_images=has_images
-        )
-        
-        # Log routing decision (backend only)
-        print(f"\n[Router] {self.router.explain_decision(decision)}")
-        
-        # Yield routing event
-        yield {
-            "type": "routing",
-            "tier": decision.tier.value,
-            "tools": [t.value for t in decision.tools],
-            "reasoning": decision.reasoning
-        }
-        
-        # Create processing context
-        context = ProcessingContext(query=query, decision=decision)
-        
-        # Gather context based on routing decision
-        # We need to modify _gather_context to yield events too, but for now let's just wrap it
-        # or refactor it to be a generator.
-        # For simplicity, let's iterate manually here or make _gather_context yield events.
-        
-        for event in self._gather_context_generator(context, files, images):
-            yield event
-        
-        # Get model config (supports admin-managed runtime overrides)
-        model_config = self._get_effective_model_config(decision.tier)
-        
-        # Build messages for LLM
-        llm_messages = self._build_messages(query, context)
-        
-        # Stream response
-        for chunk in self._generate_response(model_config, llm_messages, query, images):
-            yield {"type": "content", "content": chunk}
+        try:
+            # Route the query
+            decision = self.router.route(
+                query=query,
+                has_files=has_files,
+                file_types=file_types,
+                has_images=has_images,
+            )
+
+            # Log routing decision (backend only)
+            logger.info("[Router] %s", self.router.explain_decision(decision))
+
+            # Yield routing event
+            yield {
+                "type": "routing",
+                "tier": decision.tier.value,
+                "tools": [t.value for t in decision.tools],
+                "reasoning": decision.reasoning,
+            }
+
+            # Create processing context
+            context = ProcessingContext(query=query, decision=decision)
+
+            # Gather context based on routing decision
+            for event in self._gather_context_generator(context, files, images):
+                yield event
+
+            # Get model config (supports admin-managed runtime overrides)
+            model_config = self._get_effective_model_config(decision.tier)
+
+            # Build messages for LLM
+            llm_messages = self._build_messages(query, context)
+
+            # Stream response
+            for event in self._generate_response(model_config, llm_messages, query, images):
+                yield event
+        finally:
+            self._request_user = {}
+            self._request_token = {}
+
+    def process_agent(
+        self,
+        agent_name: str,
+        query: str,
+        files: Optional[List[Tuple[str, bytes]]] = None,
+        images: Optional[List[Tuple[str, bytes]]] = None,
+        user: Optional[Dict[str, Any]] = None,
+        token: Optional[Dict[str, Any]] = None,
+    ) -> Generator[Dict[str, Any], None, None]:
+        """Run a named workforce agent to complete a task.
+
+        This is similar to process(), but uses a fixed tool/tier profile and an
+        additional system preamble to drive task-completion behavior.
+        """
+
+        files = files or []
+        images = images or []
+
+        self._request_user = user or {}
+        self._request_token = token or {}
+
+        try:
+            agent = get_agent(agent_name)
+
+            decision = RoutingDecision(
+                tier=agent.tier,
+                tools=agent.tools,
+                reasoning=f"Agent '{agent.name}' selected",
+            )
+
+            yield {
+                "type": "routing",
+                "tier": decision.tier.value,
+                "tools": [t.value for t in decision.tools],
+                "reasoning": decision.reasoning,
+                "agent": agent.name,
+            }
+
+            context = ProcessingContext(query=query, decision=decision)
+            for event in self._gather_context_generator(context, files, images):
+                yield event
+
+            model_config = self._get_effective_model_config(decision.tier)
+            llm_messages = self._build_messages(query, context)
+
+            # Prepend agent-specific system preamble.
+            llm_messages.insert(0, {"role": "system", "content": agent.system_preamble})
+
+            for event in self._generate_response(model_config, llm_messages, query, images):
+                yield event
+        finally:
+            self._request_user = {}
+            self._request_token = {}
     
     def _gather_context_generator(
         self,
@@ -185,17 +265,118 @@ Your goal is to have natural, fluid conversations with the user.
         images: List[Tuple[str, bytes]]
     ) -> Generator[Dict[str, Any], None, None]:
         """Gather all context needed for the query - yielding status events"""
+
+        # STEP 0: Permission-aware Microsoft reads (SharePoint/OneDrive links)
+        # Uses delegated Graph token for the signed-in user, so access is enforced by Microsoft.
+        ms_urls = extract_microsoft_urls(context.query)
+        access_token = (getattr(self, "_request_token", {}) or {}).get("access_token")
+        if ms_urls and access_token:
+            max_bytes = int(getattr(self.settings, "max_file_size_mb", 100)) * 1024 * 1024
+            # Avoid pulling too many external files per prompt.
+            for url in ms_urls[:2]:
+                yield {
+                    "type": "tool",
+                    "status": "running",
+                    "tool": "microsoft_read",
+                    "message": "Reading Microsoft link...",
+                }
+                try:
+                    ref = self.ms_graph.resolve_share_link(share_url=url, access_token=access_token)
+                    data = self.ms_graph.download_drive_item_content(
+                        drive_id=ref.drive_id,
+                        item_id=ref.item_id,
+                        access_token=access_token,
+                        max_bytes=max_bytes,
+                    )
+
+                    filename = ref.name or "microsoft_file"
+                    # Treat as if the user uploaded it: extract + index.
+                    self._process_files_with_rag(context, [(filename, data)])
+                    yield {"type": "tool", "status": "complete", "tool": "microsoft_read"}
+                except Exception:
+                    logger.exception("[Microsoft] Failed to read link")
+                    yield {"type": "tool", "status": "error", "tool": "microsoft_read", "message": "Microsoft read failed."}
         
         # STEP 1: Process and index uploaded files with RAG
         if files:
             yield {"type": "tool", "status": "running", "tool": "rag_indexing", "message": f"Processing {len(files)} files..."}
-            print(f"[Context] Processing {len(files)} uploaded file(s) with RAG...")
+            logger.debug("[Context] Processing %s uploaded file(s) with RAG...", len(files))
             self._process_files_with_rag(context, files)
             self._process_databases(context, files)
             yield {"type": "tool", "status": "complete", "tool": "rag_indexing"}
+
+        # STEP 1.25: Calculator (local math) for computation questions
+        calculator_enabled_override = get_tool_override("calculator_enabled")
+        calculator_enabled = (
+            bool(calculator_enabled_override)
+            if isinstance(calculator_enabled_override, bool)
+            else bool(getattr(self.settings, "calculator_enabled", True))
+        )
+        should_calc = (
+            ToolType.CALCULATOR in (context.decision.tools or [])
+            or looks_like_math_query(context.query)
+        )
+
+        if calculator_enabled and should_calc:
+            yield {"type": "tool", "status": "running", "tool": "calculator", "message": "Computing..."}
+            try:
+                self._run_calculator(context)
+                yield {"type": "tool", "status": "complete", "tool": "calculator"}
+            except Exception as e:
+                yield {
+                    "type": "error",
+                    "where": "server",
+                    "retryable": False,
+                    "message": f"Calculator failed: {str(e)}",
+                }
+                yield {"type": "tool", "status": "error", "tool": "calculator", "message": "Calculator failed."}
+        elif should_calc and not calculator_enabled:
+            yield {
+                "type": "tool",
+                "status": "skipped",
+                "tool": "calculator",
+                "message": "Calculator is disabled by administrator.",
+            }
+
+        # STEP 1.5: Spreadsheet computation for structured files
+        if files:
+            spreadsheet_enabled_override = get_tool_override("spreadsheet_enabled")
+            spreadsheet_enabled = (
+                bool(spreadsheet_enabled_override)
+                if isinstance(spreadsheet_enabled_override, bool)
+                else bool(getattr(self.settings, "spreadsheet_enabled", True))
+            )
+
+            structured_files = [
+                (fn, b)
+                for (fn, b) in files
+                if Path(fn).suffix.lower() in {".xlsx", ".xls", ".csv"}
+            ]
+
+            if structured_files and spreadsheet_enabled:
+                yield {"type": "tool", "status": "running", "tool": "spreadsheet", "message": "Computing spreadsheet results..."}
+                try:
+                    self._process_spreadsheets(context, structured_files)
+                    yield {"type": "tool", "status": "complete", "tool": "spreadsheet"}
+                except Exception as e:
+                    yield {
+                        "type": "error",
+                        "where": "server",
+                        "retryable": False,
+                        "message": f"Spreadsheet processing failed: {str(e)}",
+                    }
+                    yield {"type": "tool", "status": "error", "tool": "spreadsheet", "message": "Spreadsheet processing failed."}
+            elif structured_files and not spreadsheet_enabled:
+                yield {
+                    "type": "tool",
+                    "status": "skipped",
+                    "tool": "spreadsheet",
+                    "message": "Spreadsheet compute is disabled by administrator.",
+                }
         
         # STEP 2: Retrieve relevant chunks using RAG
-        if files:
+        # If docs were previously indexed in this session, retrieve on every turn.
+        if files or self.rag.has_documents():
             yield {"type": "tool", "status": "running", "tool": "rag_retrieval", "message": "Searching documents..."}
             result = self._retrieve_with_rag(context)
             rag_sources = self._build_rag_sources(result)
@@ -242,10 +423,10 @@ Your goal is to have natural, fluid conversations with the user.
         try:
             results = self.web_search.search(context.query)
             context.web_results = self.web_search.format_results(results)
-            print(f"[Web Search] Found {len(results)} results")
+            logger.debug("[Web Search] Found %s results", len(results))
             return results
         except Exception as e:
-            print(f"[Web Search] Error: {e}")
+            logger.exception("[Web Search] Error")
             return []
     
     def _process_files_with_rag(self, context: ProcessingContext, files: List[Tuple[str, bytes]]):
@@ -262,15 +443,15 @@ Your goal is to have natural, fluid conversations with the user.
                 continue
             
             try:
-                print(f"[RAG] Reading {filename} ({len(file_bytes)} bytes)...")
+                logger.debug("[RAG] Reading %s (%s bytes)...", filename, len(file_bytes))
                 content = self.file_reader.read(filename, file_bytes)
                 
                 if content.error:
-                    print(f"[RAG] ERROR: {content.error}")
+                    logger.warning("[RAG] Read error for %s: %s", filename, content.error)
                     continue
                     
                 if not content.content:
-                    print(f"[RAG] WARNING: No content extracted from {filename}")
+                    logger.warning("[RAG] No content extracted from %s", filename)
                     continue
                 
                 # Determine if structured data
@@ -282,12 +463,10 @@ Your goal is to have natural, fluid conversations with the user.
                     content=content.content,
                     is_structured=is_structured
                 )
-                print(f"[RAG] Indexed {filename} -> {num_chunks} chunks")
+                logger.debug("[RAG] Indexed %s -> %s chunks", filename, num_chunks)
                 
             except Exception as e:
-                import traceback
-                print(f"[RAG] EXCEPTION reading {filename}: {e}")
-                traceback.print_exc()
+                logger.exception("[RAG] Exception reading/indexing %s", filename)
     
     def _retrieve_with_rag(self, context: ProcessingContext):
         """Retrieve relevant chunks using RAG based on the query"""
@@ -295,12 +474,12 @@ Your goal is to have natural, fluid conversations with the user.
             result = self.rag.retrieve(context.query, n_results=15)
             if result.chunks:
                 context.rag_context = self.rag.format_context(result)
-                print(f"[RAG] Retrieved {len(result.chunks)} relevant chunks from {result.source_files}")
+                logger.debug("[RAG] Retrieved %s relevant chunks from %s", len(result.chunks), result.source_files)
             else:
-                print(f"[RAG] No relevant chunks found")
+                logger.debug("[RAG] No relevant chunks found")
             return result
         except Exception as e:
-            print(f"[RAG] Retrieval error: {e}")
+            logger.exception("[RAG] Retrieval error")
             return None
 
     def _build_web_sources(self, results) -> List[Dict[str, Any]]:
@@ -369,9 +548,9 @@ Your goal is to have natural, fluid conversations with the user.
                 content = self.database.read(filename, file_bytes)
                 formatted = self.database.format_content(content)
                 context.file_contents.append(formatted)
-                print(f"[Database] Processed {filename}")
+                logger.debug("[Database] Processed %s", filename)
             except Exception as e:
-                print(f"[Database] Error reading {filename}: {e}")
+                logger.exception("[Database] Error reading %s", filename)
     
     def _analyze_images_as_text(self, context: ProcessingContext, images: List[Tuple[str, bytes]]):
         """Analyze images and convert to text descriptions (for non-vision models)"""
@@ -391,9 +570,297 @@ Your goal is to have natural, fluid conversations with the user.
                     )
                     formatted = self.vision.format_analysis(analysis)
                     context.image_analyses.append(formatted)
-                    print(f"[Vision] Analyzed {filename}")
+                    logger.debug("[Vision] Analyzed %s", filename)
             except Exception as e:
-                print(f"[Vision] Error analyzing {filename}: {e}")
+                logger.exception("[Vision] Error analyzing %s", filename)
+
+    def _run_calculator(self, context: ProcessingContext) -> None:
+        """Plan a safe expression and evaluate it locally."""
+
+        # If the user provided a bare expression, try it directly first.
+        direct = (context.query or "").strip()
+        if direct and len(direct) <= int(getattr(self.settings, "calculator_max_expression_length", 512) or 512):
+            try:
+                result = self.calculator.evaluate(direct)
+                context.file_contents.append(self.calculator.format_result(result))
+                return
+            except Exception:
+                pass
+
+        # Otherwise ask the model to translate the question into an expression.
+        model_config = self._get_effective_model_config(context.decision.tier)
+        plan = self._plan_calculator_expression(model_config, context.query)
+        expr = (plan.get("expression") or "").strip()
+        if not expr:
+            # Nothing to compute.
+            return
+
+        result = self.calculator.evaluate(expr)
+        rationale = (plan.get("rationale") or plan.get("explanation") or "").strip()
+        if rationale:
+            context.file_contents.append(f"[Calculator Plan]\n{rationale}")
+        context.file_contents.append(self.calculator.format_result(result))
+
+    def _plan_calculator_expression(self, model_config, user_query: str) -> Dict[str, Any]:
+        """Ask the model for a safe math expression we can evaluate locally."""
+        system = (
+            "You translate user math questions into a single safe expression. Return JSON only.\n\n"
+            "Rules:\n"
+            "- Output a single JSON object with keys: expression, rationale\n"
+            "- expression MUST be a single math expression compatible with Python math syntax\n"
+            "- Do NOT include code, imports, attributes, indexing, variables other than: pi, e, tau\n"
+            "- Allowed functions: abs, round, min, max, sum, sqrt, log, log10, exp, sin, cos, tan, asin, acos, atan, degrees, radians, floor, ceil, factorial, comb, perm\n"
+            "- If the question needs external facts (exchange rates, unit conversions you don't know), return an empty expression and explain in rationale.\n"
+        )
+        user = f"Question: {user_query}"
+
+        content = self._ollama_chat_once(
+            model=model_config.name,
+            messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+            options={
+                "temperature": 0.0,
+                "num_predict": 256,
+                "num_ctx": min(int(getattr(model_config, "context_window", 4096) or 4096), 4096),
+                "top_p": 1.0,
+                "top_k": 20,
+            },
+        )
+
+        parsed = self._extract_json_object(content)
+        if not isinstance(parsed, dict):
+            return {"expression": "", "rationale": "Planner returned non-JSON output."}
+
+        expr = (parsed.get("expression") or "").strip()
+        if expr and ";" in expr:
+            return {"expression": "", "rationale": "Unsafe expression (multiple statements)."}
+
+        return parsed
+
+    def _process_spreadsheets(self, context: ProcessingContext, files: List[Tuple[str, bytes]]):
+        """Profile and (when useful) compute answers over structured spreadsheet/CSV uploads."""
+        # Load tables from all structured files.
+        tables: Dict[str, Any] = {}
+        profiles = []
+
+        for filename, file_bytes in files:
+            file_tables, file_profiles = self.spreadsheet.load_tables_from_bytes(filename, file_bytes)
+
+            # Merge with unique table names.
+            for name, df in file_tables.items():
+                unique = name
+                i = 2
+                while unique in tables:
+                    unique = f"{name}_{i}"
+                    i += 1
+                tables[unique] = df
+
+                # Update profile table_name if renamed.
+                for p in file_profiles:
+                    if p.table_name == name:
+                        p.table_name = unique
+                        break
+
+            profiles.extend(file_profiles)
+
+        if not profiles:
+            return
+
+        # Always add a compact schema/profile to context.
+        context.file_contents.append(self.spreadsheet.format_profiles(profiles))
+
+        # Add deterministic, value-level profiling to improve reliability.
+        # This helps the model pick the correct columns/values (e.g., Completed vs Closed - Completed).
+        try:
+            context.file_contents.append(self.spreadsheet.format_table_insights(tables, profiles))
+        except Exception:
+            logger.exception("[Spreadsheet] Failed to build table insights")
+
+        # Only attempt query planning/execution when it looks like the user wants computation,
+        # or the router selected the spreadsheet tool.
+        wants_compute = (
+            ToolType.SPREADSHEET in (context.decision.tools or [])
+            or self._query_looks_like_spreadsheet_compute(context.query)
+        )
+        if not wants_compute:
+            return
+
+        # Deterministic fallback for a very common "easy" case: incident counts by person/month.
+        # This avoids brittle LLM-authored SQL selecting the wrong columns or using overly strict equality.
+        try:
+            incident = self.spreadsheet.try_answer_incident_count(context.query, tables)
+        except Exception:
+            incident = None
+
+        if incident is not None:
+            cols = incident.get("columns_used") or {}
+            context.file_contents.append(
+                "[Spreadsheet Fact]\n"
+                f"Incidents completed by {incident.get('person')} in {incident.get('month'):02d}/{incident.get('year')}: {incident.get('count')}\n"
+                f"(table: {incident.get('table')}; columns: status='{cols.get('status')}', person='{cols.get('person')}', date='{cols.get('date')}')"
+            )
+            return
+
+        model_config = self._get_effective_model_config(context.decision.tier)
+        try:
+            planner_hints = self.spreadsheet.build_planner_hints(tables, profiles)
+        except Exception:
+            planner_hints = ""
+
+        plan = self._plan_spreadsheet_sql(model_config, context.query, profiles, planner_hints)
+        sql = (plan.get("sql") or "").strip()
+        if not sql:
+            # If the planner couldn't produce a safe/meaningful query, fall back to profiles only.
+            return
+
+        result = self.spreadsheet.run_query(tables, sql)
+        formatted = self.spreadsheet.format_query_result(result)
+        rationale = (plan.get("rationale") or plan.get("explanation") or "").strip()
+        if rationale:
+            context.file_contents.append(f"[Spreadsheet Plan]\n{rationale}")
+        context.file_contents.append(formatted)
+
+    @staticmethod
+    def _query_looks_like_spreadsheet_compute(query: str) -> bool:
+        q = (query or "").lower()
+        keywords = [
+            "pivot",
+            "group by",
+            "sum",
+            "average",
+            "mean",
+            "median",
+            "min",
+            "max",
+            "count",
+            "distinct",
+            "trend",
+            "correlation",
+            "regression",
+            "dedupe",
+            "deduplicate",
+            "join",
+            "lookup",
+            "vlookup",
+            "match",
+            "top ",
+            "bottom ",
+        ]
+        return any(k in q for k in keywords)
+
+    def _plan_spreadsheet_sql(self, model_config, user_query: str, profiles, planner_hints: str = "") -> Dict[str, Any]:
+        """Ask the model to produce a SELECT-only DuckDB SQL query for the user's request."""
+
+        schema_lines = []
+        for p in profiles:
+            cols = ", ".join(p.columns[:80])
+            schema_lines.append(f"- {p.table_name} (rows≈{p.rows}, cols={p.cols}) columns: {cols}")
+        schema = "\n".join(schema_lines)
+
+        system = (
+            "You are a data analyst writing DuckDB SQL over uploaded tables. "
+            "Return JSON only.\n\n"
+            "Rules:\n"
+            "- Output a single JSON object with keys: sql, rationale\n"
+            "- sql MUST be a single SELECT statement (or WITH ... SELECT).\n"
+            "- Do NOT use semicolons.\n"
+            "- Do NOT use any write/DDL operations (CREATE, INSERT, UPDATE, DELETE, COPY, ATTACH, PRAGMA, INSTALL, LOAD, etc).\n"
+            "- If the question cannot be answered from the available columns, set sql to an empty string and explain why in rationale.\n"
+        )
+
+        user = (
+            f"Available tables and columns:\n{schema}\n\n"
+            + (f"Value-level profiling hints (deterministic):\n{planner_hints}\n\n" if planner_hints else "")
+            + f"User question:\n{user_query}\n"
+        )
+
+        content = self._ollama_chat_once(
+            model=model_config.name,
+            messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+            options={
+                "temperature": 0.0,
+                "num_predict": 512,
+                "num_ctx": min(int(getattr(model_config, "context_window", 4096) or 4096), 8192),
+                "top_p": 1.0,
+                "top_k": 20,
+            },
+        )
+
+        parsed = self._extract_json_object(content)
+        if not isinstance(parsed, dict):
+            return {"sql": "", "rationale": "Planner returned non-JSON output."}
+
+        sql = (parsed.get("sql") or "").strip()
+        if sql:
+            ok, reason = self.spreadsheet.is_safe_select_sql(sql)
+            if not ok:
+                return {"sql": "", "rationale": f"Planner produced unsafe SQL ({reason})."}
+        return parsed
+
+    def _ollama_chat_once(self, model: str, messages: List[Dict[str, Any]], options: Dict[str, Any]) -> str:
+        """Non-streaming Ollama chat call for internal planning steps."""
+
+        base_url = getattr(self.settings, "ollama_base_url", "http://localhost:11434").rstrip("/")
+        url = f"{base_url}/api/chat"
+        retries = int(getattr(self.settings, "ollama_retries", 2) or 0)
+        backoff = float(getattr(self.settings, "ollama_retry_backoff_seconds", 0.5) or 0.0)
+
+        timeout = httpx.Timeout(
+            connect=float(getattr(self.settings, "ollama_connect_timeout_seconds", 5.0)),
+            read=float(getattr(self.settings, "ollama_read_timeout_seconds", 600.0)),
+            write=float(getattr(self.settings, "ollama_write_timeout_seconds", 30.0)),
+            pool=5.0,
+        )
+
+        payload = {
+            "model": model,
+            "messages": messages,
+            "stream": False,
+            "options": options,
+        }
+
+        for attempt in range(retries + 1):
+            try:
+                with httpx.Client(timeout=timeout) as client:
+                    resp = client.post(url, json=payload)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    msg = (data.get("message") or {}).get("content")
+                    return msg or ""
+
+                if resp.status_code in (429, 500, 502, 503, 504) and attempt < retries:
+                    time.sleep(backoff * (2**attempt))
+                    continue
+
+                raise RuntimeError(f"Ollama planning call failed ({resp.status_code})")
+            except (httpx.ConnectError, httpx.ReadTimeout, httpx.RemoteProtocolError):
+                if attempt < retries:
+                    time.sleep(backoff * (2**attempt))
+                    continue
+                raise
+
+        return ""
+
+    @staticmethod
+    def _extract_json_object(text: str) -> Any:
+        """Best-effort JSON object extraction from model output."""
+        if not text:
+            return None
+        t = text.strip()
+        try:
+            return json.loads(t)
+        except Exception:
+            pass
+
+        # Try to extract first {...} block.
+        start = t.find("{")
+        end = t.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            snippet = t[start : end + 1]
+            try:
+                return json.loads(snippet)
+            except Exception:
+                return None
+        return None
     
     def _build_messages(self, query: str, context: ProcessingContext) -> List[Dict[str, Any]]:
         """Build message list for LLM"""
@@ -459,8 +926,8 @@ User question: {query}"""
         messages: List[Dict[str, Any]],
         user_query: str,
         images: Optional[List[Tuple[str, bytes]]] = None
-    ) -> Generator[str, None, None]:
-        """Generate response from model, streaming"""
+    ) -> Generator[Dict[str, Any], None, None]:
+        """Generate response from model, streaming."""
         
         # Prepare request with full context window support
         request_data = {
@@ -488,41 +955,90 @@ User question: {query}"""
             if image_data:
                 request_data["messages"][-1]["images"] = image_data
         
-        print(f"[Model] Using {model_config.name} ({model_config.tier.value})")
-        print(f"[Model] Context window: {model_config.context_window:,} tokens, Max output: {model_config.max_tokens:,} tokens")
+        logger.info("[Model] Using %s (%s)", model_config.name, model_config.tier.value)
+        logger.debug(
+            "[Model] Context window: %s tokens, Max output: %s tokens",
+            f"{model_config.context_window:,}",
+            f"{model_config.max_tokens:,}",
+        )
         
         full_response = ""
         
-        try:
-            # Long timeout for large models (70b can be slow on first load)
-            with httpx.Client(timeout=600.0) as client:
-                with client.stream(
-                    "POST",
-                    "http://localhost:11434/api/chat",
-                    json=request_data,
-                    timeout=600.0
-                ) as response:
-                    if response.status_code != 200:
-                        yield f"Error: Model returned status {response.status_code}. Make sure '{model_config.name}' is installed in Ollama."
-                        return
-                    
-                    for line in response.iter_lines():
-                        if line:
+        base_url = getattr(self.settings, "ollama_base_url", "http://localhost:11434").rstrip("/")
+        url = f"{base_url}/api/chat"
+
+        retries = int(getattr(self.settings, "ollama_retries", 2) or 0)
+        backoff = float(getattr(self.settings, "ollama_retry_backoff_seconds", 0.5) or 0.0)
+
+        timeout = httpx.Timeout(
+            connect=float(getattr(self.settings, "ollama_connect_timeout_seconds", 5.0)),
+            read=float(getattr(self.settings, "ollama_read_timeout_seconds", 600.0)),
+            write=float(getattr(self.settings, "ollama_write_timeout_seconds", 30.0)),
+            pool=5.0,
+        )
+
+        attempt = 0
+        while True:
+            try:
+                with httpx.Client(timeout=timeout) as client:
+                    with client.stream("POST", url, json=request_data) as response:
+                        if response.status_code != 200:
+                            yield {
+                                "type": "error",
+                                "where": "ollama",
+                                "retryable": False,
+                                "message": (
+                                    f"Model returned status {response.status_code}. "
+                                    f"Make sure '{model_config.name}' is installed and Ollama is healthy."
+                                ),
+                            }
+                            return
+
+                        for line in response.iter_lines():
+                            if not line:
+                                continue
                             try:
                                 data = json.loads(line)
-                                if "message" in data and "content" in data["message"]:
-                                    chunk = data["message"]["content"]
-                                    full_response += chunk
-                                    yield chunk
                             except json.JSONDecodeError:
                                 continue
-        
-        except httpx.ConnectError:
-            yield "Error: Cannot connect to Ollama. Make sure Ollama is running."
-            return
-        except Exception as e:
-            yield f"Error generating response: {str(e)}"
-            return
+
+                            if "message" in data and "content" in data["message"]:
+                                chunk = data["message"]["content"]
+                                if chunk:
+                                    full_response += chunk
+                                    yield {"type": "content", "content": chunk}
+
+                break
+
+            except (httpx.ConnectError, httpx.ReadTimeout, httpx.RemoteProtocolError) as e:
+                if attempt < retries:
+                    time.sleep(backoff * (2**attempt))
+                    attempt += 1
+                    continue
+
+                if isinstance(e, httpx.ConnectError):
+                    yield {
+                        "type": "error",
+                        "where": "ollama",
+                        "retryable": True,
+                        "message": "Cannot connect to Ollama. Make sure Ollama is running.",
+                    }
+                else:
+                    yield {
+                        "type": "error",
+                        "where": "ollama",
+                        "retryable": True,
+                        "message": f"Ollama request failed: {str(e)}",
+                    }
+                return
+            except Exception as e:
+                yield {
+                    "type": "error",
+                    "where": "ollama",
+                    "retryable": False,
+                    "message": f"Error generating response: {str(e)}",
+                }
+                return
         
         # Save to history
         if full_response:
@@ -539,14 +1055,15 @@ User question: {query}"""
     
     def get_available_models(self) -> List[Dict[str, Any]]:
         """Get list of available Ollama models"""
+        base_url = getattr(self.settings, "ollama_base_url", "http://localhost:11434").rstrip("/")
         try:
             with httpx.Client(timeout=10.0) as client:
-                response = client.get("http://localhost:11434/api/tags")
+                response = client.get(f"{base_url}/api/tags")
                 if response.status_code == 200:
                     data = response.json()
                     return data.get("models", [])
-        except:
-            pass
+        except Exception:
+            logger.exception("Failed to fetch available Ollama models")
         return []
     
     def check_models(self) -> Dict[ModelTier, bool]:

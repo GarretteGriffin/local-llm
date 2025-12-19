@@ -1,19 +1,24 @@
+from __future__ import annotations
+
 from typing import List, Optional, Tuple, AsyncGenerator
+
 from fastapi import APIRouter, Depends, File, Form, UploadFile, Request, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, JSONResponse
 from starlette.concurrency import iterate_in_threadpool
-from server.dependencies import get_session
-from server.auth import require_current_user
+
 from config import settings
+from core.agents import list_agents
+from server.dependencies import get_session
+from server.auth import require_current_user, get_current_token_optional
+
 import json
 import logging
 
-router = APIRouter(prefix="/chat", tags=["chat"])
+router = APIRouter(prefix="/agents", tags=["agents"])
 logger = logging.getLogger(__name__)
 
 
 def _looks_like_image_bytes(data: bytes) -> bool:
-    """Best-effort file sniffing for common image types (no external deps)."""
     if not data:
         return False
     if data.startswith(b"\x89PNG\r\n\x1a\n"):
@@ -50,26 +55,37 @@ async def _read_upload_limited(
         data.extend(chunk)
     return bytes(data)
 
+
+@router.get("")
+async def agents_index():
+    """List available workforce agents."""
+    return {"agents": list_agents()}
+
+
 @router.post("/stream")
-async def chat_stream(
+async def agent_stream(
     request: Request,
+    agent: str = Form("workforce"),
     message: str = Form(""),
     session_id: Optional[str] = Form(None),
     files: Optional[List[UploadFile]] = File(None),
     _user: dict = Depends(require_current_user),
 ) -> StreamingResponse:
+    """Stream an agent-run response (SSE).
+
+    Uses the same session store as chat to preserve document memory, but runs
+    with an agent-specific tool/tier profile.
     """
-    Stream chat response.
-    Accepts message, session_id, and optional files/images.
-    Returns Server-Sent Events (SSE).
-    """
+
     sid, state = get_session(session_id)
+    token = get_current_token_optional(request) or {}
 
     user_oid = (_user or {}).get("oid")
     user_upn = (_user or {}).get("preferred_username") or (_user or {}).get("upn")
     logger.info(
-        "Processing chat session=%s user_oid=%s user=%s",
+        "Processing agent session=%s agent=%s user_oid=%s user=%s",
         sid,
+        (agent or "workforce").strip().lower(),
         user_oid or "-",
         (user_upn or "-").strip().lower(),
     )
@@ -79,18 +95,6 @@ async def chat_stream(
     max_files = int(settings.max_upload_files)
     chunk_size = int(settings.upload_read_chunk_bytes)
 
-    content_length = request.headers.get("content-length")
-    if content_length:
-        try:
-            if int(content_length) > max_total_bytes:
-                raise HTTPException(
-                    status_code=413,
-                    detail=f"Request payload exceeds limit ({max_total_mb} MB).",
-                )
-        except ValueError:
-            # If Content-Length is malformed, ignore and rely on streaming limits.
-            pass
-
     doc_files: List[Tuple[str, bytes]] = []
     image_files: List[Tuple[str, bytes]] = []
 
@@ -98,19 +102,13 @@ async def chat_stream(
 
     if files:
         if len(files) > max_files:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Too many files uploaded (max {max_files}).",
-            )
+            raise HTTPException(status_code=400, detail=f"Too many files uploaded (max {max_files}).")
 
         for uf in files:
             filename = uf.filename or "upload"
             remaining = max_total_bytes - total_read
             if remaining <= 0:
-                raise HTTPException(
-                    status_code=413,
-                    detail=f"Request payload exceeds limit ({max_total_mb} MB).",
-                )
+                raise HTTPException(status_code=413, detail=f"Request payload exceeds limit ({max_total_mb} MB).")
 
             content = await _read_upload_limited(uf, max_bytes=remaining, chunk_size=chunk_size)
             total_read += len(content)
@@ -119,22 +117,16 @@ async def chat_stream(
                 image_files.append((filename, content))
             else:
                 doc_files.append((filename, content))
-    
+
     def _sse(payload: dict) -> bytes:
         return f"data: {json.dumps(payload)}\n\n".encode("utf-8")
 
     async def event_generator() -> AsyncGenerator[bytes, None]:
-        # Send session ID first
         yield _sse({"type": "session", "session_id": sid})
 
         try:
-            from server.auth import get_current_token_optional
-
-            token = get_current_token_optional(request) or {}
-
-            # Orchestrator.process is a synchronous generator; iterate it in a threadpool
-            # so we don't block the FastAPI event loop.
-            iterator = state.orchestrator.process(
+            iterator = state.orchestrator.process_agent(
+                agent_name=agent,
                 query=message,
                 files=doc_files if doc_files else None,
                 images=image_files if image_files else None,
@@ -143,18 +135,17 @@ async def chat_stream(
             )
 
             async for event in iterate_in_threadpool(iterator):
-                # All events now stream as JSON payloads
-                if event.get("type") == "content":
+                if event.get("type") == "content" and isinstance(event.get("content"), str):
                     event["content"] = event["content"].replace("\r", "")
                 yield _sse(event)
 
-        except Exception as e:
-            logger.error(
-                "Error in chat stream session=%s user_oid=%s user=%s",
+        except Exception:
+            logger.exception(
+                "Error in agent stream session=%s agent=%s user_oid=%s user=%s",
                 sid,
+                (agent or "workforce").strip().lower(),
                 user_oid or "-",
                 (user_upn or "-").strip().lower(),
-                exc_info=True,
             )
             yield _sse(
                 {
@@ -166,3 +157,9 @@ async def chat_stream(
             )
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+
+@router.post("/disable")
+async def disable_agents():
+    """Placeholder endpoint for future admin control (kept minimal)."""
+    return JSONResponse({"ok": True})

@@ -16,6 +16,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from threading import RLock
 from typing import Any, Dict, Optional
+import logging
 import json
 
 
@@ -27,6 +28,8 @@ _OVERRIDES_PATH = _CONFIG_DIR / "admin_overrides.json"
 _AUDIT_LOG_PATH = _CONFIG_DIR / "admin_overrides_audit.log"
 
 _LOCK = RLock()
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -72,7 +75,7 @@ def _append_audit(entry: Dict[str, Any]) -> None:
             f.write(line + "\n")
     except Exception:
         # Audit should never break production traffic.
-        pass
+        logger.exception("Failed to append admin overrides audit entry")
 
 
 def load_overrides(force_reload: bool = False) -> OverridesSnapshot:

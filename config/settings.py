@@ -24,6 +24,8 @@ class ToolType(str, Enum):
     FILE_READER = "file_reader"
     IMAGE_VISION = "image_vision"
     DATABASE = "database"
+    SPREADSHEET = "spreadsheet"
+    CALCULATOR = "calculator"
 
 
 class ModelConfig(BaseModel):
@@ -64,11 +66,29 @@ class Settings(BaseSettings):
     
     # Tool configurations
     web_search_enabled: bool = True
+    spreadsheet_enabled: bool = True
+    calculator_enabled: bool = True
     web_search_provider: str = "duckduckgo"  # or "tavily"
     tavily_api_key: Optional[str] = None
     
     # File handling - MAXED for 128GB RAM
     max_file_size_mb: int = 100
+    # Upload controls (defense-in-depth)
+    # max_upload_total_mb: maximum total request payload (best-effort enforced via Content-Length + read caps)
+    # If not set, defaults to max_file_size_mb.
+    max_upload_total_mb: Optional[int] = None
+    max_upload_files: int = 8
+    upload_read_chunk_bytes: int = 1024 * 1024
+
+    # Spreadsheet / structured data compute limits
+    # These caps exist to keep memory bounded when users upload large XLSX/CSV files.
+    spreadsheet_max_rows_per_table: int = 200_000
+    spreadsheet_max_cells_per_table: int = 5_000_000
+    spreadsheet_preview_rows: int = 20
+    spreadsheet_query_max_rows: int = 200
+
+    # Calculator limits
+    calculator_max_expression_length: int = 512
     supported_extensions: List[str] = Field(default_factory=lambda: [
         # Office
         ".docx", ".xlsx", ".pptx", ".doc", ".xls", ".ppt",
@@ -88,10 +108,24 @@ class Settings(BaseSettings):
     
     # Vision settings
     vision_model: Optional[str] = None
+
+    # Ollama settings
+    ollama_base_url: str = "http://localhost:11434"
+    ollama_connect_timeout_seconds: float = 5.0
+    ollama_read_timeout_seconds: float = 600.0
+    ollama_write_timeout_seconds: float = 30.0
+    ollama_retries: int = 2
+    ollama_retry_backoff_seconds: float = 0.5
     
     # Server settings
     ui_port: int = 7860
     api_port: int = 8000
+
+    # CORS (only needed if serving UI/API from different origins)
+    # In development, if unset, the app falls back to ["*"] for convenience.
+    # In production, prefer explicitly setting CORS_ALLOW_ORIGINS to a JSON list,
+    # e.g. '["https://your-ui.example.com"]'.
+    cors_allow_origins: List[str] = Field(default_factory=list)
 
     # Session management (in-memory) - prevents unbounded growth
     session_ttl_seconds: int = 60 * 60 * 4  # 4 hours
@@ -108,6 +142,16 @@ class Settings(BaseSettings):
     azure_client_id: Optional[str] = None
     azure_client_secret: Optional[str] = None
     azure_redirect_uri: Optional[str] = None
+
+    # OAuth scopes requested during Entra sign-in.
+    # Defaults include User.Read so the backend can validate identity against Microsoft Graph.
+    # Add additional delegated scopes as needed for permission-aware content reads (e.g., Files.Read).
+    azure_scopes: List[str] = Field(default_factory=lambda: [
+        "openid",
+        "profile",
+        "email",
+        "User.Read",
+    ])
 
     # Allow-list controls (optional)
     auth_allowed_tenant_ids: List[str] = Field(default_factory=list)
@@ -135,7 +179,7 @@ class Settings(BaseSettings):
                 name="qwen2.5:14b",  # UPGRADED: Llama 3.2 was too weak. 14B is fast enough (133 t/s).
                 backend="ollama",
                 tier=ModelTier.QUICK,
-                temperature=0.7,
+                temperature=0.3,
                 max_tokens=1024,
                 context_window=16384,
                 top_p=0.9,
@@ -145,7 +189,7 @@ class Settings(BaseSettings):
                 name="qwen2.5:14b",  # Switched to 14B for better speed/quality balance
                 backend="ollama",
                 tier=ModelTier.STANDARD,
-                temperature=0.7,  # Higher temp for better engagement
+                temperature=0.4,  # Lower temp reduces hallucinations
                 max_tokens=2048,
                 context_window=16384,
                 top_p=0.9,
@@ -155,7 +199,7 @@ class Settings(BaseSettings):
                 name="qwen2.5:32b",  # Keep 32B for heavy lifting
                 backend="ollama",
                 tier=ModelTier.POWER,
-                temperature=0.4,  # Slightly higher but still focused
+                temperature=0.2,  # Most reliable for analysis and grounding
                 max_tokens=4096,
                 context_window=32768,
                 top_p=0.95,
@@ -194,6 +238,14 @@ class Settings(BaseSettings):
                 tools=[ToolType.WEB_SEARCH],
                 priority=10
             ),
+            # Math / computation - prefer local calculator over web
+            RoutingRule(
+                keywords=["calculate", "compute", "evaluate", "solve", "percent", "percentage",
+                         "margin", "cagr", "compound", "interest"],
+                tier=ModelTier.QUICK,
+                tools=[ToolType.CALCULATOR],
+                priority=12
+            ),
             RoutingRule(
                 keywords=["analyze", "analysis", "compare", "comparison", "evaluate",
                          "fiscal", "quarterly", "revenue", "profit", "loss", "budget",
@@ -202,8 +254,17 @@ class Settings(BaseSettings):
                          "expenditure", "financial", "report", "summarize document",
                          "review this", "what does this mean", "implications"],
                 tier=ModelTier.POWER,
-                tools=[ToolType.FILE_READER, ToolType.DATABASE, ToolType.WEB_SEARCH],
+                tools=[ToolType.FILE_READER, ToolType.DATABASE, ToolType.SPREADSHEET, ToolType.WEB_SEARCH],
                 priority=20
+            ),
+            RoutingRule(
+                keywords=["spreadsheet", "excel", "xlsx", "csv", "pivot", "group by",
+                         "sum", "average", "mean", "median", "std", "standard deviation",
+                         "percent", "percentage", "variance", "join", "lookup", "vlookup",
+                         "match", "dedupe", "deduplicate", "correlation", "regression"],
+                tier=ModelTier.POWER,
+                tools=[ToolType.SPREADSHEET, ToolType.FILE_READER],
+                priority=25
             ),
             RoutingRule(
                 keywords=["image", "picture", "photo", "screenshot", "diagram",
@@ -217,7 +278,7 @@ class Settings(BaseSettings):
                 keywords=["file", "document", "spreadsheet", "pdf", "excel", 
                          "word", "powerpoint", "database", "qvd", "open", "read"],
                 tier=ModelTier.POWER,
-                tools=[ToolType.FILE_READER, ToolType.DATABASE],
+                tools=[ToolType.FILE_READER, ToolType.DATABASE, ToolType.SPREADSHEET],
                 priority=15
             ),
         ]

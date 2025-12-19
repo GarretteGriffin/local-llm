@@ -7,8 +7,11 @@ from pathlib import Path
 from typing import Optional, Dict, Any, List, Union
 from dataclasses import dataclass
 import tempfile
+import logging
 
 from config import settings
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -247,7 +250,8 @@ class DatabaseTool:
                 if conn is not None:
                     conn.close()
             except Exception:
-                pass
+                # Best-effort cleanup; never fail the request.
+                logger.debug("Failed to close Access DB connection", exc_info=True)
     
     def _read_qvd(self, file_path: str, filename: str) -> DatabaseContent:
         """Read QlikView QVD file"""
@@ -293,8 +297,8 @@ class DatabaseTool:
                 try:
                     unique = df[col].nunique()
                     content_parts.append(f"  {col}: {unique} unique values")
-                except:
-                    pass
+                except Exception:
+                    continue
             
             return DatabaseContent(
                 filename=filename,

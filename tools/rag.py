@@ -7,6 +7,7 @@ import hashlib
 import httpx
 import logging
 import os
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Dict, Any, Optional, Tuple
 from dataclasses import dataclass
@@ -14,6 +15,8 @@ from pathlib import Path
 import chromadb
 from chromadb.config import Settings as ChromaSettings
 import re
+
+from config import settings
 
 logger = logging.getLogger(__name__)
 
@@ -69,22 +72,55 @@ class RAGTool:
         )
         
         self._session_docs: Dict[str, str] = {}  # Track docs added this session
+
+    def has_documents(self) -> bool:
+        """Return True if any documents have been indexed this session."""
+        return bool(self._session_docs)
     
     def _get_embedding(self, text: str) -> Optional[List[float]]:
         """Get embedding from Ollama"""
-        try:
-            with httpx.Client(timeout=30.0) as client:
-                response = client.post(
-                    "http://localhost:11434/api/embeddings",
-                    json={
-                        "model": self.EMBEDDING_MODEL,
-                        "prompt": text
-                    }
-                )
+        base_url = settings.ollama_base_url.rstrip("/")
+        url = f"{base_url}/api/embeddings"
+        retries = int(getattr(settings, "ollama_retries", 2) or 0)
+        backoff = float(getattr(settings, "ollama_retry_backoff_seconds", 0.5) or 0.0)
+
+        timeout = httpx.Timeout(
+            connect=float(getattr(settings, "ollama_connect_timeout_seconds", 5.0)),
+            read=30.0,
+            write=float(getattr(settings, "ollama_write_timeout_seconds", 30.0)),
+            pool=5.0,
+        )
+
+        for attempt in range(retries + 1):
+            try:
+                with httpx.Client(timeout=timeout) as client:
+                    response = client.post(
+                        url,
+                        json={
+                            "model": self.EMBEDDING_MODEL,
+                            "prompt": text,
+                        },
+                    )
+
                 if response.status_code == 200:
-                    return response.json()["embedding"]
-        except Exception:
-            logger.exception("RAG embedding error")
+                    return response.json().get("embedding")
+
+                # Retry on transient upstream errors.
+                if response.status_code in (429, 500, 502, 503, 504) and attempt < retries:
+                    time.sleep(backoff * (2**attempt))
+                    continue
+
+                logger.warning("RAG embedding failed (%s)", response.status_code)
+                return None
+            except (httpx.ConnectError, httpx.ReadTimeout, httpx.RemoteProtocolError) as e:
+                if attempt < retries:
+                    time.sleep(backoff * (2**attempt))
+                    continue
+                logger.exception("RAG embedding connection error")
+                return None
+            except Exception:
+                logger.exception("RAG embedding error")
+                return None
         return None
     
     def _get_embeddings_batch(self, texts: List[str]) -> List[Optional[List[float]]]:
@@ -304,7 +340,7 @@ class RAGTool:
                 include=["documents", "metadatas", "distances"]
             )
         except Exception as e:
-            print(f"[RAG] Query error: {e}")
+            logger.exception("RAG query error")
             return RetrievalResult(chunks=[], total_chars=0, source_files=[])
         
         # Build result
@@ -327,7 +363,7 @@ class RAGTool:
                     source_files.add(metadata.get('filename', 'unknown'))
                     total_chars += len(doc)
         
-        print(f"[RAG] Retrieved {len(chunks)} relevant chunks ({total_chars:,} chars)")
+        logger.debug("RAG retrieved %s chunks (%s chars)", len(chunks), f"{total_chars:,}")
         
         return RetrievalResult(
             chunks=chunks,
@@ -359,9 +395,9 @@ class RAGTool:
                 metadata={"hnsw:space": "cosine"}
             )
             self._session_docs.clear()
-            print("[RAG] Cleared all indexed documents")
+            logger.info("RAG cleared all indexed documents")
         except Exception as e:
-            print(f"[RAG] Clear error: {e}")
+            logger.exception("RAG clear error")
     
     def get_stats(self) -> Dict[str, Any]:
         """Get statistics about indexed documents"""
@@ -372,5 +408,6 @@ class RAGTool:
                 "indexed_files": list(self._session_docs.keys()),
                 "embedding_model": self.EMBEDDING_MODEL
             }
-        except:
+        except Exception:
+            logger.exception("RAG stats error")
             return {"total_chunks": 0, "indexed_files": [], "embedding_model": self.EMBEDDING_MODEL}
